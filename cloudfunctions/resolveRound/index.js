@@ -383,13 +383,65 @@ function getSide(room, playerId) {
 }
 
 /**
+ * 纯函数：胜负判定与加时判定（不依赖 DB，便于单测）。
+ * 规则：
+ *   ① 常规局：踢满 totalRounds 后比分高者胜；平局进入加时（suddenDeath=true）。
+ *   ② 提前胜出：每脚结算后评估，某方落后分数 > 其剩余脚数 即提前结束。
+ *   ③ 加时（Sudden Death）：每轮 A、B 各踢 1 脚，仅当 B 踢完（一对结束）才判胜负；
+ *      无限加时，必分胜负（无 DRAW）。
+ * @param {object} room 结算前快照（含 roundShooter/totalRounds/suddenDeath）
+ * @param {{A:number,B:number}} nextScore 结算后比分
+ * @param {number} nextRoundIndex 结算后已踢完脚数
+ * @returns {{state:'PLAYING'|'FINISHED', winner:null|'A'|'B', suddenDeath:boolean}}
+ */
+function determineGame(room, nextScore, nextRoundIndex) {
+  const totalRounds =
+    typeof room.totalRounds === 'number' && room.totalRounds > 0 ? room.totalRounds : 10;
+  const suddenDeath = !!room.suddenDeath;
+
+  // ③ 加时赛：仅当 B 踢完（一对结束）才判胜负；仍平则继续
+  if (suddenDeath) {
+    if (room.roundShooter === 'B') {
+      if (nextScore.A > nextScore.B) return { state: 'FINISHED', winner: 'A', suddenDeath: true };
+      if (nextScore.B > nextScore.A) return { state: 'FINISHED', winner: 'B', suddenDeath: true };
+    }
+    return { state: 'PLAYING', winner: null, suddenDeath: true };
+  }
+
+  // ① 常规局踢满
+  if (nextRoundIndex >= totalRounds) {
+    if (nextScore.A > nextScore.B) return { state: 'FINISHED', winner: 'A', suddenDeath: false };
+    if (nextScore.B > nextScore.A) return { state: 'FINISHED', winner: 'B', suddenDeath: false };
+    // 平局 → 进入加时
+    return { state: 'PLAYING', winner: null, suddenDeath: true };
+  }
+
+  // ② 提前胜出：落后分数 > 其剩余脚数（严格大于，能追平则继续）
+  const per = Math.floor(totalRounds / 2);
+  const kicksTakenA = Math.ceil(nextRoundIndex / 2);
+  const kicksTakenB = Math.floor(nextRoundIndex / 2);
+  const kicksLeftA = per - kicksTakenA;
+  const kicksLeftB = per - kicksTakenB;
+  if (nextScore.A - nextScore.B > kicksLeftB) {
+    return { state: 'FINISHED', winner: 'A', suddenDeath: false };
+  }
+  if (nextScore.B - nextScore.A > kicksLeftA) {
+    return { state: 'FINISHED', winner: 'B', suddenDeath: false };
+  }
+
+  return { state: 'PLAYING', winner: null, suddenDeath: false };
+}
+
+/**
  * 纯函数：结算一回合（不依赖 DB，便于单测）。
  * 根据 room.roundShooter 动态判定攻守双方（实现轮流射门）；
- * outcome 为 GOAL 时给射门方计分；结算后翻转 roundShooter。
- * @param {object} room 房间快照（含 roundIndex/roundShooter/score）
+ * outcome 为 GOAL 时给射门方计分；结算后翻转 roundShooter；
+ * 通过 determineGame 给出 game 级状态（state/winner/suddenDeath）。
+ * @param {object} room 房间快照（含 roundIndex/roundShooter/score/totalRounds/suddenDeath）
  * @param {object} actionA 玩家 A 的本回合动作（含 tier）
  * @param {object} actionB 玩家 B 的本回合动作（含 tier）
- * @returns {{result:object, nextScore:{A:number,B:number}, nextRoundShooter:string, nextRoundIndex:number}}
+ * @returns {{result:object, nextScore:{A:number,B:number}, nextRoundShooter:string,
+ *            nextRoundIndex:number, game:{state:string,winner:string|null,suddenDeath:boolean}}}
  */
 function settleRound(room, actionA, actionB) {
   const roundIndex = typeof room.roundIndex === 'number' ? room.roundIndex : 0;
@@ -407,11 +459,16 @@ function settleRound(room, actionA, actionB) {
     nextScore[shooterIsA ? 'A' : 'B'] += 1;
   }
 
+  const nextRoundShooter = shooterIsA ? 'B' : 'A';
+  const nextRoundIndex = roundIndex + 1;
+  const game = determineGame(room, nextScore, nextRoundIndex);
+
   return {
     result,
     nextScore,
-    nextRoundShooter: shooterIsA ? 'B' : 'A',
-    nextRoundIndex: roundIndex + 1,
+    nextRoundShooter,
+    nextRoundIndex,
+    game,
   };
 }
 
@@ -537,14 +594,14 @@ async function submitWithLock(roomId, playerId, clientRoundIndex, swipeRes) {
 
       // ---- 双方是否都已提交 ----
       if (otherAction && otherAction.playerId) {
-        // 已齐 → 纯函数结算（含计分与攻守轮换）
+        // 已齐 → 纯函数结算（含计分、攻守轮换与胜负判定）
         const fullActionA = actionKey === 'actionA' ? actionData : otherAction;
         const fullActionB = actionKey === 'actionB' ? actionData : otherAction;
-        const { result, nextScore, nextRoundShooter, nextRoundIndex } = settleRound(
+        const { result, nextScore, nextRoundShooter, nextRoundIndex, game } = settleRound(
           room, fullActionA, fullActionB,
         );
 
-        // 写结果 + 计分 + 轮换 + 回合 +1 + 清空双方动作
+        // 写结果 + 计分 + 轮换 + 回合 +1 + 胜负状态 + 清空双方动作
         await transaction.collection('rooms').doc(roomId).update({
           data: {
             actionA: null,
@@ -552,9 +609,13 @@ async function submitWithLock(roomId, playerId, clientRoundIndex, swipeRes) {
             roundIndex: nextRoundIndex,
             roundShooter: nextRoundShooter,
             score: nextScore,
+            suddenDeath: game.suddenDeath,
+            winner: game.winner,
+            state: game.state,
             lastResult: Object.assign({}, result, {
               settledRound: serverRound,
               settledAt: Date.now(),
+              game,
             }),
           },
         });
@@ -568,6 +629,7 @@ async function submitWithLock(roomId, playerId, clientRoundIndex, swipeRes) {
           roundIndex: nextRoundIndex,
           roundShooter: nextRoundShooter,
           score: nextScore,
+          game,
         });
       }
 
@@ -664,6 +726,7 @@ exports.main = async (event) => {
 exports.resolveRound = resolveRound;
 exports.resolvePowerMatrix = resolvePowerMatrix;
 exports.settleRound = settleRound;
+exports.determineGame = determineGame;
 exports.computePower = computePower;
 exports.toLane = toLane;
 exports.toTier = toTier;

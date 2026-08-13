@@ -14,6 +14,7 @@ const State = Object.freeze({
   SUBMITTING: 'SUBMITTING', // 已划屏，云函数提交中（禁输入）
   ANIMATING: 'ANIMATING',   // 双方齐，播放结算动画
   NEXT_ROUND: 'NEXT_ROUND', // 动画结束，横幅停留，准备下一轮
+  FINISHED: 'FINISHED',     // 比赛结束，结算弹窗（仅允许点按，屏蔽划屏）
 });
 
 // ---- 当前状态 ----

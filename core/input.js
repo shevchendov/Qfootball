@@ -24,6 +24,9 @@ let scaleFactor = DESIGN_W / 375; // 默认 2.0，供极端环境下兜底
 // 滑屏完成回调
 let swipeHandler = null;
 
+// 点按（Tap）回调：{ x, y } 设计坐标
+let tapHandler = null;
+
 // 触摸起点：{ x, y, t }（t 为毫秒时间戳）
 let touchStart = null;
 
@@ -53,6 +56,15 @@ function init() {
  */
 function setSwipeHandler(fn) {
   swipeHandler = typeof fn === 'function' ? fn : null;
+}
+
+/**
+ * 注册点按（Tap）回调。
+ * 位移小于 MIN_DIST 的 touch 视为点按，回调接收设计坐标 { x, y }。
+ * @param {({x:number, y:number}) => void} fn
+ */
+function setTapHandler(fn) {
+  tapHandler = typeof fn === 'function' ? fn : null;
 }
 
 /**
@@ -122,9 +134,19 @@ function onTouchEnd(e) {
   const swipe = computeSwipe(touchStart, end, duration);
   touchStart = null;
 
-  // 误触过滤：位移过短视为无效滑动
+  // 误触过滤：位移过短视为点按（Tap），否则视为滑屏
   const distance = Math.hypot(swipe.dx, swipe.dy);
-  if (distance < MIN_DIST) return;
+  if (distance < MIN_DIST) {
+    // 点按：以设计坐标回调（取触摸终点）
+    if (tapHandler) {
+      try {
+        tapHandler({ x: end.x, y: end.y });
+      } catch (err) {
+        console.error('[input] tap handler error', err);
+      }
+    }
+    return;
+  }
 
   if (swipeHandler) {
     try {
@@ -145,6 +167,7 @@ function onTouchCancel() {
 module.exports = {
   init,
   setSwipeHandler,
+  setTapHandler,
   toDesignCoords,
   computeSwipe,
   toLaneLocal,

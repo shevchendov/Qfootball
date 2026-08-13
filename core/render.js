@@ -19,6 +19,8 @@ const {
   BALL_START,
   STATUS_BAR_H,
   COLORS,
+  SETTLEMENT,
+  LOBBY,
 } = config;
 
 let ctx = null;   // 2D 上下文
@@ -442,6 +444,133 @@ function drawShoe(x, y, rot, alpha) {
   ctx.restore();
 }
 
+// =====================================================================
+//  通用按钮（圆角矩形 + 居中文字）
+// =====================================================================
+function drawButton(rect, text, bgColor, textColor) {
+  if (!ctx) return;
+  ctx.save();
+  ctx.fillStyle = bgColor || '#3a9d4b';
+  roundRectPath(rect.x, rect.y, rect.w, rect.h, 18);
+  ctx.fill();
+  ctx.strokeStyle = 'rgba(255,255,255,0.5)';
+  ctx.lineWidth = 3;
+  ctx.stroke();
+  ctx.fillStyle = textColor || '#ffffff';
+  ctx.font = 'bold 34px sans-serif';
+  ctx.textAlign = 'center';
+  ctx.textBaseline = 'middle';
+  ctx.fillText(text, rect.x + rect.w / 2, rect.y + rect.h / 2 + 2);
+  ctx.restore();
+}
+
+// =====================================================================
+//  结算弹窗（比赛结束）
+//  info: { winner: 'A'|'B'|null, mySide: 'A'|'B', score: {A,B} }
+// =====================================================================
+function drawSettlement(info) {
+  if (!ctx) return;
+  const data = info || {};
+  const { winner, mySide, score } = data;
+  const sc = score || { A: 0, B: 0 };
+  const mySideText = mySide || 'A';
+
+  // 全屏遮罩
+  ctx.fillStyle = 'rgba(0,0,0,0.62)';
+  ctx.fillRect(0, 0, DESIGN_W, DESIGN_H);
+
+  // 面板
+  ctx.fillStyle = '#2b3a55';
+  roundRectPath(SETTLEMENT.dialog.x, SETTLEMENT.dialog.y, SETTLEMENT.dialog.w, SETTLEMENT.dialog.h, 24);
+  ctx.fill();
+  ctx.strokeStyle = 'rgba(255,255,255,0.35)';
+  ctx.lineWidth = 4;
+  ctx.stroke();
+
+  // 胜负 Banner
+  let bannerText;
+  let bannerColor;
+  if (winner === null || winner === undefined) {
+    bannerText = '比赛结束';
+    bannerColor = '#ffffff';
+  } else if (winner === mySideText) {
+    bannerText = '胜利！';
+    bannerColor = '#ffd93b';
+  } else {
+    bannerText = '惜败…';
+    bannerColor = '#9aa8c0';
+  }
+  ctx.save();
+  ctx.font = 'bold 60px sans-serif';
+  ctx.textAlign = 'center';
+  ctx.textBaseline = 'middle';
+  ctx.lineWidth = 8;
+  ctx.strokeStyle = 'rgba(0,0,0,0.7)';
+  ctx.strokeText(bannerText, DESIGN_W / 2, SETTLEMENT.bannerY);
+  ctx.fillStyle = bannerColor;
+  ctx.fillText(bannerText, DESIGN_W / 2, SETTLEMENT.bannerY);
+  ctx.restore();
+
+  // 大比分看板
+  ctx.save();
+  ctx.font = 'bold 96px sans-serif';
+  ctx.textAlign = 'center';
+  ctx.textBaseline = 'middle';
+  ctx.fillStyle = '#ffffff';
+  ctx.strokeStyle = 'rgba(0,0,0,0.55)';
+  ctx.lineWidth = 10;
+  ctx.strokeText(`${sc.A} - ${sc.B}`, DESIGN_W / 2, SETTLEMENT.scoreY);
+  ctx.fillText(`${sc.A} - ${sc.B}`, DESIGN_W / 2, SETTLEMENT.scoreY);
+  ctx.restore();
+
+  // 按钮
+  drawButton(SETTLEMENT.btnRematch, '再来一局', '#3a9d4b');
+  drawButton(SETTLEMENT.btnHome, '返回主页', '#5a6b82');
+}
+
+// =====================================================================
+//  大厅 UI（未入局 / 匹配等待）
+//  info: { matching: boolean } 匹配中则隐藏按钮显示等待文案
+// =====================================================================
+function drawLobby(info) {
+  if (!ctx) return;
+  const data = info || {};
+
+  // 标题
+  ctx.save();
+  ctx.font = 'bold 68px sans-serif';
+  ctx.textAlign = 'center';
+  ctx.textBaseline = 'middle';
+  ctx.lineWidth = 10;
+  ctx.strokeStyle = 'rgba(0,0,0,0.55)';
+  ctx.strokeText(LOBBY.title, DESIGN_W / 2, LOBBY.titleY);
+  ctx.fillStyle = '#ffd93b';
+  ctx.fillText(LOBBY.title, DESIGN_W / 2, LOBBY.titleY);
+  ctx.restore();
+
+  // 副标题
+  ctx.save();
+  ctx.font = '30px sans-serif';
+  ctx.textAlign = 'center';
+  ctx.textBaseline = 'middle';
+  ctx.fillStyle = 'rgba(255,255,255,0.85)';
+  ctx.fillText(LOBBY.subtitle, DESIGN_W / 2, LOBBY.subtitleY);
+  ctx.restore();
+
+  // 匹配中：显示等待文案；否则显示「开始比赛」按钮
+  if (data.matching) {
+    ctx.save();
+    ctx.font = 'bold 36px sans-serif';
+    ctx.textAlign = 'center';
+    ctx.textBaseline = 'middle';
+    ctx.fillStyle = '#ffffff';
+    ctx.fillText('匹配中，寻找对手…', DESIGN_W / 2, LOBBY.btnStart.y + LOBBY.btnStart.h / 2);
+    ctx.restore();
+  } else {
+    drawButton(LOBBY.btnStart, '开始比赛', '#3a9d4b');
+  }
+}
+
 module.exports = {
   initRenderer,
   beginFrame,
@@ -453,4 +582,6 @@ module.exports = {
   drawHint,
   drawBanner,
   drawFx,
+  drawSettlement,
+  drawLobby,
 };

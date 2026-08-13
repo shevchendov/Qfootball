@@ -3,17 +3,18 @@
  *  核心调度与组装（core/bootstrap.js）
  * =====================================================================
  *  职责：
- *    1. 一次性初始化：主画布、dpr 缩放、渲染器、手势模块、主循环。
- *    2. 绑定 input 划屏事件，串起 状态机 → 云函数 → 动画 的完整流程。
- *    3. joinGame()：入房成功后由 matchManager 调用，拉取房间并开启 watchRoom。
- *    4. 开启 watchRoom 实时监听，支撑「被动接收对方结算」场景。
- *    5. 启动 requestAnimationFrame 主循环，按状态绘制画面。
+ *    1. 一次性初始化：主画布、dpr 缩放、渲染器、手势模块（滑屏 + 点按）、主循环。
+ *    2. 大厅态：未入局时绘制大厅与「开始比赛」按钮，点按触发匹配。
+ *    3. joinGame()：入房成功后拉取房间并开启 watchRoom（重连/再来一局可复用）。
+ *    4. 对局态：划屏 → 云函数 → 动画；动画播完按 gameState 切 NEXT_ROUND 或 FINISHED。
+ *    5. FINISHED 态：绘制结算弹窗，AABB 命中「再来一局 / 返回主页」。
  *
  *  状态流转：
- *    IDLE ─划屏─> SUBMITTING ─结算成功─> ANIMATING ─动画完─> NEXT_ROUND ─停留─> IDLE
- *                └─等待对方─> IDLE（显示"等待对方划屏"）
+ *    大厅(IDLE) ─开始比赛─> 匹配 ─入房─> IDLE ─划屏─> SUBMITTING ─结算─> ANIMATING
+ *       ─gameState PLAYING─> NEXT_ROUND ─停留─> IDLE
+ *       ─gameState FINISHED─> FINISHED ─(再来一局/返回主页)─> 大厅
  *
- *  入房解耦：init() 不再直接入房，改由 matchManager 匹配成功后调用 joinGame()。
+ *  解耦：本模块不 require matchManager，通过 setUiHandlers 接受入房/重开回调。
  * =====================================================================
  */
 const config = require('../config/config');
@@ -32,14 +33,19 @@ const NEXT_ROUND_HOLD = 1600;
 // 结算冲突自动重试上限
 const CONFLICT_MAX_RETRY = 1;
 
-// ---- 会话状态（房间 / 玩家 / 回合）----
+// ---- 会话状态（房间 / 玩家 / 回合 / 胜负）----
 const session = {
+  lobby: true,           // 是否处于大厅态（未入局）
+  matching: false,       // 是否匹配中（大厅态下隐藏开始按钮）
   roomId: '',
   playerId: '',
   mySide: null,          // 'A' | 'B'：我方所在边（joinGame 传入）
   roundShooter: 'A',     // 本回合射门方（服务端为准，watch/提交响应同步）
   roundIndex: 0,         // 当前回合号（以服务端为准）
   score: { A: 0, B: 0 }, // 比分（服务端为准）
+  gameState: 'PLAYING',  // 'PLAYING' | 'FINISHED'
+  winner: null,          // 'A' | 'B'（无 DRAW）
+  suddenDeath: false,    // 是否加时赛
   lastPlayedRound: -1,   // 已播放动画的最高 settledRound（防重复播放）
   waitingPrompt: '',     // 状态栏提示文案
   roundSubmitted: false, // 本轮是否已提交（防止重复划屏）
@@ -47,6 +53,7 @@ const session = {
 
 // ---- 运行期对象 ----
 let ctx = null;
+let watcher = null;         // watchRoom 句柄
 let currentTimeline = null; // 当前动画时间线
 let pose = {};              // tick 输出（ball/keeper/fx/done）
 let animStart = 0;          // 动画开始时间（Date.now）
@@ -55,8 +62,15 @@ let conflictRetry = 0;      // 结算冲突重试计数
 let inputReady = false;     // input.init 防重复注册
 let watchStarted = false;   // watchRoom 防重复开启
 
+// ---- 大厅/结算按钮回调（由 matchManager 注册）----
+const uiHandlers = {
+  onStart: null,   // 大厅「开始比赛」
+  onRematch: null, // 结算「再来一局」
+  onHome: null,    // 结算「返回主页」
+};
+
 // =====================================================================
-//  一次性初始化（不再包含入房逻辑）
+//  一次性初始化
 // =====================================================================
 function init() {
   // ---- 1. 系统信息 + 画布（物理像素 = 逻辑像素 × dpr）----
@@ -73,28 +87,92 @@ function init() {
   config.setScreen({ width: windowWidth, height: windowHeight, dpr });
   render.initRenderer(ctx, { width: canvas.width, height: canvas.height });
 
-  // ---- 2. 手势模块 ----
+  // ---- 2. 手势模块（滑屏 + 点按）----
   if (!inputReady) {
     input.init();
     input.setSwipeHandler(onSwipe);
+    input.setTapHandler(onTap);
     inputReady = true;
   }
 
-  // ---- 3. 大厅提示（未入房）----
-  session.waitingPrompt = '匹配中，寻找对手…';
+  // ---- 3. 大厅初始状态 ----
+  session.lobby = true;
+  session.waitingPrompt = '';
 
   // ---- 4. 启动主循环 ----
   mainLoop.start(frame);
 }
 
 // =====================================================================
-//  入房（matchManager 匹配成功后调用）
+//  大厅 / 入房 接口（供 matchManager 调用）
 // =====================================================================
+/** 注册 UI 回调（大厅开始 / 再来一局 / 返回主页） */
+function setUiHandlers(handlers) {
+  if (handlers && typeof handlers.onStart === 'function') uiHandlers.onStart = handlers.onStart;
+  if (handlers && typeof handlers.onRematch === 'function') uiHandlers.onRematch = handlers.onRematch;
+  if (handlers && typeof handlers.onHome === 'function') uiHandlers.onHome = handlers.onHome;
+}
+
+/** 设置大厅提示/匹配中状态 */
+function setHint(text) {
+  session.waitingPrompt = text || '';
+}
+
+/** 设置匹配中状态（大厅态隐藏「开始比赛」按钮） */
+function setMatching(flag) {
+  session.matching = !!flag;
+}
+
+/** 回到大厅（清空会话，返回空闲态） */
+function showLobby() {
+  leaveRoom();
+  session.waitingPrompt = '';
+}
+
+/**
+ * 离开当前对局/清理会话。
+ * 关闭 watch、复位 session 与状态机，进入大厅态。
+ */
+function leaveRoom() {
+  if (watcher && typeof watcher.close === 'function') {
+    try { watcher.close(); } catch (_e) { /* 忽略 */ }
+  }
+  watcher = null;
+  watchStarted = false;
+
+  session.lobby = true;
+  session.matching = false;
+  session.roomId = '';
+  session.playerId = '';
+  session.mySide = null;
+  session.roundShooter = 'A';
+  session.roundIndex = 0;
+  session.score = { A: 0, B: 0 };
+  session.gameState = 'PLAYING';
+  session.winner = null;
+  session.suddenDeath = false;
+  session.lastPlayedRound = -1;
+  session.roundSubmitted = false;
+  session.waitingPrompt = '';
+
+  currentTimeline = null;
+  pose = {};
+  stateMachine.to(State.IDLE);
+}
+
+/**
+ * 入房（匹配成功 / 断线重连 / 再来一局后调用）。
+ * 可重复调用：会自动复位 watchStarted 并重建监听。
+ */
 function joinGame({ roomId, playerId, role }) {
   if (!roomId || !playerId) {
     session.waitingPrompt = '入房参数缺失';
     return;
   }
+
+  watchStarted = false; // 允许重连/重开重建监听
+  session.lobby = false;
+  session.matching = false;
   session.roomId = roomId;
   session.playerId = playerId;
   session.mySide = role === 'B' ? 'B' : 'A';
@@ -109,12 +187,19 @@ function joinGame({ roomId, playerId, role }) {
         session.roundIndex = room.roundIndex || 0;
         session.roundShooter = room.roundShooter || 'A';
         session.score = room.score || { A: 0, B: 0 };
-        // 若房间已有一笔结算，补足已播放游标，避免重放
+        session.suddenDeath = !!room.suddenDeath;
+        session.gameState = room.state || 'PLAYING';
+        session.winner = room.winner || null;
+        // 离开期间已结算的回合不重放动画
         if (room.lastResult && room.lastResult.settledRound != null) {
           session.lastPlayedRound = room.lastResult.settledRound;
         }
         startWatch();
         session.waitingPrompt = '';
+        // 防御：房间已是 FINISHED → 直接进结算弹窗态
+        if (session.gameState === 'FINISHED') {
+          stateMachine.to(State.FINISHED);
+        }
       } else {
         session.waitingPrompt = '房间加载失败';
       }
@@ -125,21 +210,15 @@ function joinGame({ roomId, playerId, role }) {
     });
 }
 
-/** 设置大厅/提示文案（matchManager 使用） */
-function setHint(text) {
-  session.waitingPrompt = text || '';
-}
-
 // =====================================================================
 //  划屏 → 提交
 // =====================================================================
 async function onSwipe(swipe) {
-  if (!session.roomId || !session.playerId) {
-    session.waitingPrompt = '未加入房间';
+  if (session.lobby || !session.roomId || !session.playerId) {
+    session.waitingPrompt = session.lobby ? '请点击开始比赛' : '未加入房间';
     return;
   }
   if (session.roundSubmitted) {
-    // 本轮已提交，等待对方
     session.waitingPrompt = '已提交，等待对方划屏…';
     return;
   }
@@ -177,6 +256,12 @@ function handleSubmitResp(resp, swipe) {
         session.roundIndex = data.roundIndex;
         if (data.roundShooter) session.roundShooter = data.roundShooter;
         if (data.score) session.score = data.score;
+        // 结算响应中的 game 与 result 分离，需显式同步胜负状态
+        if (data.game) {
+          session.suddenDeath = !!data.game.suddenDeath;
+          session.gameState = data.game.state || 'PLAYING';
+          session.winner = data.game.winner || null;
+        }
         // 防止 watch 与提交响应同时触发导致重复播放
         const settledRound = data.roundIndex - 1;
         if (settledRound > session.lastPlayedRound) {
@@ -191,7 +276,6 @@ function handleSubmitResp(resp, swipe) {
       break;
     }
     case ErrorKind.ALREADY_SUBMITTED: {
-      // 幂等：保持等待
       session.roundSubmitted = true;
       stateMachine.to(State.IDLE);
       session.waitingPrompt = '已提交，等待对方划屏…';
@@ -247,18 +331,21 @@ function handleSubmitResp(resp, swipe) {
 }
 
 // =====================================================================
-//  实时监听（被动接收结算 + 同步 roundShooter/score）
+//  实时监听（被动接收结算 + 同步 roundShooter/score/胜负）
 // =====================================================================
 function startWatch() {
   if (watchStarted || !session.roomId) return;
   watchStarted = true;
 
-  cloud.watchRoom(
+  watcher = cloud.watchRoom(
     session.roomId,
     (room) => {
       if (room.roundIndex != null) session.roundIndex = room.roundIndex;
       if (room.roundShooter) session.roundShooter = room.roundShooter;
       if (room.score) session.score = room.score;
+      if (room.suddenDeath != null) session.suddenDeath = room.suddenDeath;
+      if (room.state) session.gameState = room.state;
+      if (room.winner) session.winner = room.winner;
 
       const lr = room.lastResult;
       const settledRound = lr && lr.settledRound;
@@ -279,30 +366,83 @@ function startWatch() {
 }
 
 // =====================================================================
-//  动画触发
+//  动画触发（含胜负状态同步）
 // =====================================================================
 function startAnimation(result, settledRound) {
   currentTimeline = animator.buildTimeline(result);
   pose = {};
   animStart = Date.now();
   if (settledRound != null) session.lastPlayedRound = settledRound;
+  // 从结算结果同步胜负状态（result.game）
+  if (result && result.game) {
+    session.suddenDeath = !!result.game.suddenDeath;
+    session.gameState = result.game.state || 'PLAYING';
+    session.winner = result.game.winner || null;
+  }
   session.waitingPrompt = '';
   stateMachine.to(State.ANIMATING);
+}
+
+// =====================================================================
+//  点按处理（AABB 命中检测）
+// =====================================================================
+function onTap(p) {
+  // 大厅态：命中「开始比赛」
+  if (session.lobby) {
+    if (!session.matching && uiHandlers.onStart && hitTest(p, config.LOBBY.btnStart)) {
+      uiHandlers.onStart();
+    }
+    return;
+  }
+  // 结算弹窗态：命中「再来一局 / 返回主页」
+  if (stateMachine.getState() === State.FINISHED) {
+    if (uiHandlers.onRematch && hitTest(p, config.SETTLEMENT.btnRematch)) {
+      uiHandlers.onRematch();
+    } else if (uiHandlers.onHome && hitTest(p, config.SETTLEMENT.btnHome)) {
+      uiHandlers.onHome();
+    }
+  }
+}
+
+/** AABB 碰撞检测：点是否落在矩形内 */
+function hitTest(p, rect) {
+  return (
+    p.x >= rect.x && p.x <= rect.x + rect.w && p.y >= rect.y && p.y <= rect.y + rect.h
+  );
 }
 
 // =====================================================================
 //  主循环帧函数
 // =====================================================================
 function frame() {
-  // 1. 清屏 + 场景
   render.beginFrame();
   render.drawPitch();
   render.drawGoal();
 
   const st = stateMachine.getState();
+
+  // ---- 大厅态 ----
+  if (session.lobby) {
+    render.drawStatusBar({ roundIndex: '-', hint: session.waitingPrompt || '大厅' });
+    render.drawLobby({ matching: session.matching });
+    return;
+  }
+
   render.drawStatusBar({ roundIndex: session.roundIndex, hint: buildHint() });
 
-  // 2. 动画中：推进时间轴并绘制
+  // ---- 结算弹窗态 ----
+  if (st === State.FINISHED) {
+    render.drawKeeper(null);
+    render.drawBall({ x: config.BALL_START.x, y: config.BALL_START.y, scale: 1, rotation: 0 });
+    render.drawSettlement({
+      winner: session.winner,
+      mySide: session.mySide,
+      score: session.score,
+    });
+    return;
+  }
+
+  // ---- 动画中 ----
   if (st === State.ANIMATING && currentTimeline) {
     const elapsed = Date.now() - animStart;
     animator.tick(currentTimeline, elapsed, pose);
@@ -313,8 +453,13 @@ function frame() {
     render.drawBanner(currentTimeline.banner, animator.clamp(elapsed / currentTimeline.total, 0, 1));
 
     if (pose.done) {
-      stateMachine.to(State.NEXT_ROUND);
-      roundEnd = Date.now();
+      // 动画播完：按胜负状态决定进入 FINISHED 或 NEXT_ROUND
+      if (session.gameState === 'FINISHED') {
+        stateMachine.to(State.FINISHED);
+      } else {
+        stateMachine.to(State.NEXT_ROUND);
+        roundEnd = Date.now();
+      }
     }
   } else if (st === State.NEXT_ROUND && currentTimeline) {
     // NEXT_ROUND：保持动画末态 + 结算横幅
@@ -324,28 +469,33 @@ function frame() {
     render.drawBall(pose.ball);
     render.drawFx([]);
     render.drawBanner(currentTimeline.banner, 1);
+
+    if (Date.now() - roundEnd > NEXT_ROUND_HOLD) {
+      // watch 延迟到达 FINISHED 时直接进弹窗态
+      if (session.gameState === 'FINISHED') {
+        stateMachine.to(State.FINISHED);
+      } else {
+        session.roundSubmitted = false;
+        session.waitingPrompt = '';
+        stateMachine.to(State.IDLE);
+      }
+    }
   } else {
     // 静止场景：门将初始站位 + 球在点球点
     render.drawKeeper(null);
     render.drawBall({ x: config.BALL_START.x, y: config.BALL_START.y, scale: 1, rotation: 0 });
   }
-
-  // 3. NEXT_ROUND：停留展示后回到 IDLE
-  if (st === State.NEXT_ROUND && Date.now() - roundEnd > NEXT_ROUND_HOLD) {
-    session.roundSubmitted = false;
-    session.waitingPrompt = '';
-    stateMachine.to(State.IDLE);
-  }
 }
 
 /**
- * 状态栏提示合成：未入房/大厅提示优先；已入房则「比分 · 划屏指引」。
+ * 状态栏提示合成：大厅/提示优先；对局中「比分 · 划屏指引」。
  */
 function buildHint() {
   if (session.waitingPrompt) return session.waitingPrompt;
-  if (!session.roomId) return '未加入房间';
+  if (session.lobby || !session.roomId) return '大厅';
   const sc = session.score || { A: 0, B: 0 };
-  return `${sc.A}:${sc.B} · ${baseHint()}`;
+  const suffix = session.suddenDeath ? ' · 加时赛' : '';
+  return `${sc.A}:${sc.B}${suffix} · ${baseHint()}`;
 }
 
 /** 按本回合攻守角色给出划屏指引（轮流射门，roundShooter 为准） */
@@ -358,6 +508,10 @@ function baseHint() {
 module.exports = {
   init,
   joinGame,
+  showLobby,
+  leaveRoom,
   setHint,
+  setMatching,
+  setUiHandlers,
   getSession: () => session,
 };

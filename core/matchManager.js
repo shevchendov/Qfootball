@@ -3,15 +3,15 @@
  *  客户端匹配管理（core/matchManager.js）
  * =====================================================================
  *  职责：
- *    1. start()：调用 matchPlayer(MATCH_RANDOM) 发起随机匹配。
- *    2. role='A'：等待方 → setInterval 轮询 GET_STATUS，
- *       配对成功后将 roomId/role 落盘并调用 bootstrap.joinGame。
- *    3. role='B'：已配对 → 直接落盘并调用 bootstrap.joinGame。
- *    4. 落盘键：roomId / playerId / role（与 bootstrap 入房参数对应）。
+ *    1. start()：启动流程——有 Storage roomId 则尝试断线重连
+ *       （PLAYING → 恢复对局；FINISHED/不存在 → 清 Storage 回大厅）；
+ *       否则直接进入大厅等待「开始比赛」。
+ *    2. 注册大厅/结算 UI 回调（开始比赛 / 再来一局 / 返回主页）。
+ *    3. role='A'：等待方轮询 GET_STATUS；role='B'：直接入房。
  *
  *  解耦约定：
- *    - 本模块不持有游戏渲染/状态机，只负责「入房前」的匹配编排；
- *    - 入房成功后所有游戏逻辑交给 bootstrap（joinGame）。
+ *    - 本模块不持有游戏渲染/状态机，只负责「入房前」的匹配编排与重连；
+ *    - 入房成功后所有游戏逻辑交给 bootstrap（joinGame / leaveRoom）。
  * =====================================================================
  */
 const bootstrap = require('./bootstrap');
@@ -31,6 +31,7 @@ const CLOUD_ROUND_FN = 'resolveRound';
 
 // 运行中状态
 let pollTimer = null;            // 等待方轮询句柄
+let uiBound = false;             // UI 回调只注册一次
 
 /**
  * 通用云函数调用（失败兜底为结构化响应）。
@@ -63,8 +64,30 @@ function stopPoll() {
   }
 }
 
+/** 注册大厅/结算 UI 回调（只注册一次） */
+function bindUiHandlers() {
+  if (uiBound) return;
+  uiBound = true;
+  bootstrap.setUiHandlers({
+    onStart: () => {
+      bootstrap.setMatching(true);
+      doRandomMatch();
+    },
+    onRematch: () => {
+      bootstrap.leaveRoom();
+      clearRoomStorage();
+      doRandomMatch();
+    },
+    onHome: () => {
+      bootstrap.leaveRoom();
+      clearRoomStorage();
+      bootstrap.showLobby();
+    },
+  });
+}
+
 /**
- * 匹配入口。
+ * 启动入口：断线重连分派 → 否则进大厅。
  * @param {string} [mode] 'random'（本期仅支持随机匹配）
  */
 function start(mode) {
@@ -72,58 +95,72 @@ function start(mode) {
     bootstrap.setHint('本期仅支持随机匹配');
     return;
   }
-  doRandomMatch();
+  bindUiHandlers();
+
+  // ---- 0. 尝试断线重连 ----
+  const existingRoomId = wx.getStorageSync(STORAGE_KEYS.ROOM_ID);
+  if (existingRoomId) {
+    tryReconnect(existingRoomId);
+    return;
+  }
+  // 无历史房间 → 大厅
+  bootstrap.showLobby();
 }
 
 /**
- * 随机匹配主流程。
+ * 断线重连：查房间状态分派。
+ * @param {string} roomId
+ */
+async function tryReconnect(roomId) {
+  const playerId = wx.getStorageSync(STORAGE_KEYS.PLAYER_ID);
+  const resp = await callCloud(CLOUD_ROUND_FN, { action: 'GET_ROOM', roomId });
+
+  if (resp && resp.code === 0 && resp.data && resp.data.room) {
+    const room = resp.data.room;
+    if (room.state === 'PLAYING' && playerId) {
+      const role = wx.getStorageSync(STORAGE_KEYS.ROLE) || (room.playerA_Id === playerId ? 'A' : 'B');
+      bootstrap.joinGame({ roomId, playerId, role });
+      return;
+    }
+    // state === 'FINISHED' → 清 Storage 回大厅
+  }
+  // 房间不存在 / 其它异常 → 清 Storage 回大厅
+  clearRoomStorage();
+  bootstrap.showLobby();
+}
+
+/**
+ * 随机匹配主流程（由「开始比赛 / 再来一局」触发）。
  */
 async function doRandomMatch() {
-  // ---- 0. 已有房间上下文 → 尝试重连（仍在 PLAYING 则直接入房）----
-  const existingRoomId = wx.getStorageSync(STORAGE_KEYS.ROOM_ID);
-  if (existingRoomId) {
-    const playerId = wx.getStorageSync(STORAGE_KEYS.PLAYER_ID);
-    const resp = await callCloud(CLOUD_ROUND_FN, { action: 'GET_ROOM', roomId: existingRoomId });
-    if (resp && resp.code === 0 && resp.data && resp.data.room) {
-      const room = resp.data.room;
-      if (room.state === 'PLAYING' && playerId) {
-        const role = wx.getStorageSync(STORAGE_KEYS.ROLE) || (room.playerA_Id === playerId ? 'A' : 'B');
-        bootstrap.joinGame({ roomId: existingRoomId, playerId, role });
-        return;
-      }
-    }
-    // 房间失效 → 清理旧上下文
-    clearRoomStorage();
-  }
-
-  // ---- 1. 发起匹配 ----
+  stopPoll();
+  bootstrap.setMatching(true);
   bootstrap.setHint('匹配中，寻找对手…');
 
   const resp = await callCloud(CLOUD_MATCH_FN, { action: 'MATCH_RANDOM' });
   if (!resp || resp.code !== 0) {
+    bootstrap.setMatching(false);
     bootstrap.setHint('匹配失败，请重试');
     return;
   }
 
   const data = resp.data || {};
   if (!data.playerId) {
+    bootstrap.setMatching(false);
     bootstrap.setHint('匹配异常，请重试');
     return;
   }
 
   if (data.role === 'A') {
-    // ---- 2a. 等待方（A）：落盘身份 + 轮询 GET_STATUS ----
+    // 等待方（A）：落盘身份 + 轮询 GET_STATUS
     wx.setStorageSync(STORAGE_KEYS.PLAYER_ID, data.playerId);
     wx.setStorageSync(STORAGE_KEYS.ROLE, 'A');
     pollWaiting(data.playerId);
   } else if (data.role === 'B') {
-    // ---- 2b. 已配对（B）：直接入房 ----
-    enterRoom({
-      roomId: data.roomId,
-      playerId: data.playerId,
-      role: 'B',
-    });
+    // 已配对（B）：直接入房
+    enterRoom({ roomId: data.roomId, playerId: data.playerId, role: 'B' });
   } else {
+    bootstrap.setMatching(false);
     bootstrap.setHint('匹配异常，请重试');
   }
 }
@@ -142,6 +179,7 @@ function pollWaiting(playerId) {
       stopPoll();
       callCloud(CLOUD_MATCH_FN, { action: 'CANCEL' });
       clearRoomStorage();
+      bootstrap.setMatching(false);
       bootstrap.setHint('匹配超时，请重试');
       return;
     }
@@ -149,11 +187,7 @@ function pollWaiting(playerId) {
     const resp = await callCloud(CLOUD_MATCH_FN, { action: 'GET_STATUS' });
     if (resp && resp.code === 0 && resp.data && resp.data.matched && resp.data.roomId) {
       stopPoll();
-      enterRoom({
-        roomId: resp.data.roomId,
-        playerId,
-        role: 'A',
-      });
+      enterRoom({ roomId: resp.data.roomId, playerId, role: 'A' });
     }
   }, POLL_INTERVAL);
 }
@@ -164,6 +198,7 @@ function pollWaiting(playerId) {
  */
 function enterRoom(data) {
   if (!data || !data.roomId || !data.playerId) {
+    bootstrap.setMatching(false);
     bootstrap.setHint('入房失败，请重试');
     return;
   }

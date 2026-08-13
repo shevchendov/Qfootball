@@ -163,6 +163,25 @@ const RESULT_ANIM = {
 };
 
 // =====================================================================
+//  结算弹窗 / 大厅 UI 布局（设计空间 750x1334）
+// =====================================================================
+const SETTLEMENT = {
+  dialog: { x: 95, y: 300, w: 560, h: 540 },
+  bannerY: 400,                                   // 胜负 Banner 文案 y
+  scoreY: 470,                                    // 大比分 y
+  btnRematch: { x: 225, y: 660, w: 300, h: 88 },  // 再来一局
+  btnHome: { x: 225, y: 772, w: 300, h: 88 },     // 返回主页
+};
+
+const LOBBY = {
+  title: '1v1 点球大战',
+  titleY: 400,
+  subtitle: '实时对战 · 盲盒点球',
+  subtitleY: 490,
+  btnStart: { x: 225, y: 900, w: 300, h: 100 },   // 开始比赛
+};
+
+// =====================================================================
 //  错误码（与后端 ErrCode 对齐，NETWORK 为本地新增）
 // =====================================================================
 const ErrCode = Object.freeze({
@@ -211,6 +230,8 @@ module.exports = {
   SHOT_PARAMS,
   DIVE_PARAMS,
   RESULT_ANIM,
+  SETTLEMENT,
+  LOBBY,
   ErrCode,
   ERROR_MSG,
 };
