@@ -1,0 +1,10 @@
+{
+  "libVersion": "3.17.0",
+  "projectname": "Qfootball",
+  "projectenv": "cloud1-d7g9uo3la0e6ce2c4",
+  "setting": {
+    "urlCheck": true,
+    "coverView": true,
+    "compileHotReload": true
+  }
+}
