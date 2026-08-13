@@ -35,9 +35,9 @@ const db = cloud.database();
 // =====================================================================
 //  一、调参常量（滑屏 → 力度，需实测校准）
 // =====================================================================
-const MIN_DIST = 10;    // 有效滑屏最小距离 dp，低于视为误触
-const MAX_DIST = 400;   // 满力度参考距离 dp
-const MAX_VELO = 5;     // 满力度参考速度 dp/ms（≈5000dp/s）
+const MIN_DIST = 10;    // 有效滑屏最小距离（设计空间 px），低于视为误触
+const MAX_DIST = 800;   // 满力度参考距离（设计空间 px，对应 750 宽度归一化后的满屏滑动）
+const MAX_VELO = 10;    // 满力度参考速度 px/ms（≈10000px/s）
 const W_DIST = 0.35;    // 距离权重
 const W_VELO = 0.65;    // 速度权重（速度为主，防止"慢速满屏拖"刷满力度）
 const LANE_THRESHOLD = 0.3; // 方向离散化水平分量阈值
@@ -195,8 +195,15 @@ function toTier(power, role) {
 
 /**
  * 构造结算结果对象（附搞笑文案）。
+ * @param {string} outcome
+ * @param {string} code
+ * @param {string} shooterTier
+ * @param {string} keeperTier
+ * @param {boolean} laneMatched
+ * @param {string} shooterLane 射门方实际方向（前端据此播放球的飞行方向）
+ * @param {string} keeperLane  守门方实际方向（前端据此播放门将扑救方向）
  */
-function buildResult(outcome, code, shooterTier, keeperTier, laneMatched) {
+function buildResult(outcome, code, shooterTier, keeperTier, laneMatched, shooterLane, keeperLane) {
   return {
     outcome,
     code,
@@ -204,6 +211,8 @@ function buildResult(outcome, code, shooterTier, keeperTier, laneMatched) {
     shooterTier,
     keeperTier,
     laneMatched,
+    shooterLane,
+    keeperLane,
   };
 }
 
@@ -224,7 +233,9 @@ function resolveRound(attacker, defender, roundSeed) {
   // ---- 优先级 1：射门方自身失误（爆表踢飞）----
   if (shotTier === ShotPowerTier.Overkill) {
     const code = pickMissFlavor(diveTier, roundSeed);
-    return buildResult(RoundOutcome.Miss, code, shotTier, diveTier, laneMatched);
+    return buildResult(
+      RoundOutcome.Miss, code, shotTier, diveTier, laneMatched, shooterLane, keeperLane,
+    );
   }
 
   // ---- 优先级 2：守门方自身失误（爆表滑倒脸刹）----
@@ -235,6 +246,8 @@ function resolveRound(attacker, defender, roundSeed) {
       shotTier,
       diveTier,
       laneMatched,
+      shooterLane,
+      keeperLane,
     );
   }
 
@@ -246,48 +259,68 @@ function resolveRound(attacker, defender, roundSeed) {
       shotTier,
       diveTier,
       laneMatched,
+      shooterLane,
+      keeperLane,
     );
   }
 
   // ---- 优先级 4：方向一致 → 力度克制矩阵 ----
-  return resolvePowerMatrix(shotTier, diveTier, laneMatched);
+  return resolvePowerMatrix(shotTier, diveTier, laneMatched, shooterLane, keeperLane);
 }
 
 /**
  * 力度克制矩阵（方向一致时）。
  * 克制环：SOFT 克 HARD（勺子）→ HARD 克 POWER（极限扑）→ POWER 克 SOFT/STANDARD（重炮）
  */
-function resolvePowerMatrix(shot, dive, laneMatched) {
+function resolvePowerMatrix(shot, dive, laneMatched, shooterLane, keeperLane) {
   // 门将：小力原地（不怎么起跳，只能挡慢球）
   if (dive === DivePowerTier.Soft) {
     if (shot === ShotPowerTier.Soft) {
-      return buildResult(RoundOutcome.Save, RoundResultCode.SAVE_CATCH, shot, dive, laneMatched);
+      return buildResult(
+        RoundOutcome.Save, RoundResultCode.SAVE_CATCH, shot, dive, laneMatched, shooterLane, keeperLane,
+      );
     }
     if (shot === ShotPowerTier.Standard) {
-      return buildResult(RoundOutcome.Goal, RoundResultCode.GOAL_CLEAN, shot, dive, laneMatched);
+      return buildResult(
+        RoundOutcome.Goal, RoundResultCode.GOAL_CLEAN, shot, dive, laneMatched, shooterLane, keeperLane,
+      );
     }
-    return buildResult(RoundOutcome.Goal, RoundResultCode.GOAL_CANNON, shot, dive, laneMatched);
+    return buildResult(
+      RoundOutcome.Goal, RoundResultCode.GOAL_CANNON, shot, dive, laneMatched, shooterLane, keeperLane,
+    );
   }
 
   // 门将：标准侧扑（常规扑救）
   if (dive === DivePowerTier.Standard) {
     if (shot === ShotPowerTier.Soft) {
-      return buildResult(RoundOutcome.Save, RoundResultCode.SAVE_CLEAN, shot, dive, laneMatched);
+      return buildResult(
+        RoundOutcome.Save, RoundResultCode.SAVE_CLEAN, shot, dive, laneMatched, shooterLane, keeperLane,
+      );
     }
     if (shot === ShotPowerTier.Standard) {
-      return buildResult(RoundOutcome.Save, RoundResultCode.SAVE_CLEAN, shot, dive, laneMatched);
+      return buildResult(
+        RoundOutcome.Save, RoundResultCode.SAVE_CLEAN, shot, dive, laneMatched, shooterLane, keeperLane,
+      );
     }
-    return buildResult(RoundOutcome.Goal, RoundResultCode.GOAL_CANNON, shot, dive, laneMatched);
+    return buildResult(
+      RoundOutcome.Goal, RoundResultCode.GOAL_CANNON, shot, dive, laneMatched, shooterLane, keeperLane,
+    );
   }
 
   // 门将：极限飞身（飞得极远）
   if (shot === ShotPowerTier.Soft) {
-    return buildResult(RoundOutcome.Goal, RoundResultCode.GOAL_SPOON, shot, dive, laneMatched);
+    return buildResult(
+      RoundOutcome.Goal, RoundResultCode.GOAL_SPOON, shot, dive, laneMatched, shooterLane, keeperLane,
+    );
   }
   if (shot === ShotPowerTier.Standard) {
-    return buildResult(RoundOutcome.Save, RoundResultCode.SAVE_FLYING, shot, dive, laneMatched);
+    return buildResult(
+      RoundOutcome.Save, RoundResultCode.SAVE_FLYING, shot, dive, laneMatched, shooterLane, keeperLane,
+    );
   }
-  return buildResult(RoundOutcome.Save, RoundResultCode.SAVE_FLYING, shot, dive, laneMatched);
+  return buildResult(
+    RoundOutcome.Save, RoundResultCode.SAVE_FLYING, shot, dive, laneMatched, shooterLane, keeperLane,
+  );
 }
 
 /**
