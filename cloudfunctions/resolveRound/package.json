@@ -1,0 +1,9 @@
+{
+  "name": "resolveRound",
+  "version": "1.0.0",
+  "description": "1v1 实时点球小游戏 · 回合结算云函数",
+  "main": "index.js",
+  "dependencies": {
+    "wx-server-sdk": "latest"
+  }
+}

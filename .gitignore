@@ -1,0 +1,14 @@
+# 微信小程序/云开发
+miniprogram_npm/
+node_modules/
+*.log
+
+# 云函数本地依赖（部署时由云端安装）
+cloudfunctions/**/node_modules/
+
+# 系统/编辑器
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
+*.local
