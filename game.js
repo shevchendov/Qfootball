@@ -3,11 +3,9 @@
  *  小游戏入口（game.js）
  * =====================================================================
  *  1. 初始化微信云开发（必须在调用云函数/watch 前完成）。
- *  2. 启动游戏主流程（bootstrap）。
- *
- *  房间与玩家信息读取顺序：
- *    - bootstrap.init({ roomId, playerId }) 显式传入；
- *    - 未传则从 Storage（roomId / playerId）读取，由匹配流程写入。
+ *  2. bootstrap.init()：一次性初始化画布/渲染/输入/主循环（大厅态）。
+ *  3. matchManager.start('random')：发起随机匹配，
+ *     成功后内部调用 bootstrap.joinGame() 进入对局。
  * =====================================================================
  */
 
@@ -17,5 +15,8 @@ wx.cloud.init({
   traceUser: true,
 });
 
-// 启动游戏主流程
+// 一次性初始化（渲染空闲场景 + 主循环）
 require('./core/bootstrap').init();
+
+// 发起随机匹配（成功后自动入房）
+require('./core/matchManager').start('random');

@@ -11,11 +11,13 @@
  *       {
  *         _id        : 房间ID,
  *         roundIndex : 0,                 // 当前回合（兼作结算随机种子）
- *         playerA_Id : 'A玩家openid',      // 固定射门方
- *         playerB_Id : 'B玩家openid',      // 固定守门方
- *         state      : 'PLAYING',         // PLAYING / FINISHED
- *         actionA    : null,              // 射门方本回合动作
- *         actionB    : null,              // 守门方本回合动作
+ *         playerA_Id : 'A玩家openid',      // 建房者（边 A）
+ *         playerB_Id : 'B玩家openid',      // 加入者（边 B）
+ *         roundShooter: 'A',              // 本回合射门方（轮流射门）
+ *         score      : { A: 0, B: 0 },    // 比分
+ *         state      : 'PLAYING',         // WAITING / PLAYING / FINISHED
+ *         actionA    : null,              // 边 A 玩家本回合动作
+ *         actionB    : null,              // 边 B 玩家本回合动作
  *         lastResult : null               // 最近一次结算结果
  *       }
  *    3. 客户端通过 db.collection('rooms').doc(roomId).watch() 监听
@@ -373,11 +375,44 @@ function isNotFoundError(err) {
   return code === -502004 || /not exist|不存在|does not exist/i.test(msg);
 }
 
-/** 判断玩家身份，返回 Role.Shooter / Role.Keeper / null */
-function getPlayerRole(room, playerId) {
-  if (room.playerA_Id && room.playerA_Id === playerId) return Role.Shooter;
-  if (room.playerB_Id && room.playerB_Id === playerId) return Role.Keeper;
+/** 判断玩家所属边，返回 'A' | 'B' | null（攻守角色由 roundShooter 动态决定） */
+function getSide(room, playerId) {
+  if (room.playerA_Id && room.playerA_Id === playerId) return 'A';
+  if (room.playerB_Id && room.playerB_Id === playerId) return 'B';
   return null;
+}
+
+/**
+ * 纯函数：结算一回合（不依赖 DB，便于单测）。
+ * 根据 room.roundShooter 动态判定攻守双方（实现轮流射门）；
+ * outcome 为 GOAL 时给射门方计分；结算后翻转 roundShooter。
+ * @param {object} room 房间快照（含 roundIndex/roundShooter/score）
+ * @param {object} actionA 玩家 A 的本回合动作（含 tier）
+ * @param {object} actionB 玩家 B 的本回合动作（含 tier）
+ * @returns {{result:object, nextScore:{A:number,B:number}, nextRoundShooter:string, nextRoundIndex:number}}
+ */
+function settleRound(room, actionA, actionB) {
+  const roundIndex = typeof room.roundIndex === 'number' ? room.roundIndex : 0;
+  const shooterIsA = (room.roundShooter || 'A') === 'A';
+
+  const attacker = shooterIsA ? actionA : actionB;
+  const defender = shooterIsA ? actionB : actionA;
+
+  const result = resolveRound(attacker, defender, roundIndex);
+
+  // 计分：GOAL 时射门方 +1（兼容旧房间缺失 score 字段）
+  const cur = room.score && typeof room.score === 'object' ? room.score : { A: 0, B: 0 };
+  const nextScore = { A: cur.A || 0, B: cur.B || 0 };
+  if (result.outcome === RoundOutcome.Goal) {
+    nextScore[shooterIsA ? 'A' : 'B'] += 1;
+  }
+
+  return {
+    result,
+    nextScore,
+    nextRoundShooter: shooterIsA ? 'B' : 'A',
+    nextRoundIndex: roundIndex + 1,
+  };
 }
 
 // =====================================================================
@@ -442,9 +477,9 @@ async function submitWithLock(roomId, playerId, clientRoundIndex, swipeRes) {
       const room = snap.data;
       const serverRound = typeof room.roundIndex === 'number' ? room.roundIndex : 0;
 
-      // ---- 玩家身份校验 ----
-      const role = getPlayerRole(room, playerId);
-      if (!role) {
+      // ---- 玩家身份校验（按 A/B 边，攻守角色由 roundShooter 决定）----
+      const side = getSide(room, playerId);
+      if (!side) {
         await transaction.rollback();
         return fail(ErrCode.PLAYER_NOT_IN_ROOM, 'player_not_in_room');
       }
@@ -470,14 +505,20 @@ async function submitWithLock(roomId, playerId, clientRoundIndex, swipeRes) {
         });
       }
 
-      const actionKey = role === Role.Shooter ? 'actionA' : 'actionB';
-      const otherKey = actionKey === 'actionA' ? 'actionB' : 'actionA';
+      const actionKey = side === 'A' ? 'actionA' : 'actionB';
+      const otherKey = side === 'A' ? 'actionB' : 'actionA';
 
       // ---- 防重提交：本回合该玩家已提交过 ----
       if (room[actionKey] && room[actionKey].playerId) {
         await transaction.rollback();
         return fail(ErrCode.ALREADY_SUBMITTED, 'already_submitted');
       }
+
+      // ---- 本回合攻守角色（按 roundShooter，实现轮流射门）----
+      const shooterIsA = (room.roundShooter || 'A') === 'A';
+      const myRole = side === 'A'
+        ? (shooterIsA ? Role.Shooter : Role.Keeper)
+        : (shooterIsA ? Role.Keeper : Role.Shooter);
 
       // ---- 组装本回合动作数据 ----
       const actionData = {
@@ -488,7 +529,7 @@ async function submitWithLock(roomId, playerId, clientRoundIndex, swipeRes) {
         duration: swipeRes.duration,
         power: swipeRes.power,
         lane: swipeRes.lane,
-        tier: toTier(swipeRes.power, role),
+        tier: toTier(swipeRes.power, myRole),
         submittedAt: Date.now(),
       };
 
@@ -496,17 +537,21 @@ async function submitWithLock(roomId, playerId, clientRoundIndex, swipeRes) {
 
       // ---- 双方是否都已提交 ----
       if (otherAction && otherAction.playerId) {
-        // 已齐 → 结算（actionA 为射门方，actionB 为守门方）
-        const attacker = actionKey === 'actionA' ? actionData : otherAction;
-        const defender = actionKey === 'actionA' ? otherAction : actionData;
-        const result = resolveRound(attacker, defender, serverRound);
+        // 已齐 → 纯函数结算（含计分与攻守轮换）
+        const fullActionA = actionKey === 'actionA' ? actionData : otherAction;
+        const fullActionB = actionKey === 'actionB' ? actionData : otherAction;
+        const { result, nextScore, nextRoundShooter, nextRoundIndex } = settleRound(
+          room, fullActionA, fullActionB,
+        );
 
-        // 写结果 + 回合 +1 + 清空双方动作
+        // 写结果 + 计分 + 轮换 + 回合 +1 + 清空双方动作
         await transaction.collection('rooms').doc(roomId).update({
           data: {
             actionA: null,
             actionB: null,
-            roundIndex: serverRound + 1,
+            roundIndex: nextRoundIndex,
+            roundShooter: nextRoundShooter,
+            score: nextScore,
             lastResult: Object.assign({}, result, {
               settledRound: serverRound,
               settledAt: Date.now(),
@@ -520,7 +565,9 @@ async function submitWithLock(roomId, playerId, clientRoundIndex, swipeRes) {
           settled: true,
           waiting: false,
           result,
-          roundIndex: serverRound + 1,
+          roundIndex: nextRoundIndex,
+          roundShooter: nextRoundShooter,
+          score: nextScore,
         });
       }
 
@@ -616,10 +663,12 @@ exports.main = async (event) => {
 // 导出核心纯函数，便于本地单元测试
 exports.resolveRound = resolveRound;
 exports.resolvePowerMatrix = resolvePowerMatrix;
+exports.settleRound = settleRound;
 exports.computePower = computePower;
 exports.toLane = toLane;
 exports.toTier = toTier;
 exports.buildResult = buildResult;
+exports.getSide = getSide;
 exports.Enums = {
   Role,
   ShotLane,

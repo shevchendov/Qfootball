@@ -3,17 +3,17 @@
  *  核心调度与组装（core/bootstrap.js）
  * =====================================================================
  *  职责：
- *    1. 创建主画布、初始化 dpr 缩放与渲染器。
+ *    1. 一次性初始化：主画布、dpr 缩放、渲染器、手势模块、主循环。
  *    2. 绑定 input 划屏事件，串起 状态机 → 云函数 → 动画 的完整流程。
- *    3. 开启 watchRoom 实时监听，支撑「被动接收对方结算」场景。
- *    4. 启动 requestAnimationFrame 主循环，按状态绘制画面。
+ *    3. joinGame()：入房成功后由 matchManager 调用，拉取房间并开启 watchRoom。
+ *    4. 开启 watchRoom 实时监听，支撑「被动接收对方结算」场景。
+ *    5. 启动 requestAnimationFrame 主循环，按状态绘制画面。
  *
  *  状态流转：
  *    IDLE ─划屏─> SUBMITTING ─结算成功─> ANIMATING ─动画完─> NEXT_ROUND ─停留─> IDLE
  *                └─等待对方─> IDLE（显示"等待对方划屏"）
  *
- *  入口：require('./core/bootstrap').init({ roomId, playerId }) 或
- *        require('./core/bootstrap').init()（从 Storage 读取）
+ *  入房解耦：init() 不再直接入房，改由 matchManager 匹配成功后调用 joinGame()。
  * =====================================================================
  */
 const config = require('../config/config');
@@ -36,8 +36,10 @@ const CONFLICT_MAX_RETRY = 1;
 const session = {
   roomId: '',
   playerId: '',
-  myRole: null,          // 'SHOOTER' | 'KEEPER' | null
+  mySide: null,          // 'A' | 'B'：我方所在边（joinGame 传入）
+  roundShooter: 'A',     // 本回合射门方（服务端为准，watch/提交响应同步）
   roundIndex: 0,         // 当前回合号（以服务端为准）
+  score: { A: 0, B: 0 }, // 比分（服务端为准）
   lastPlayedRound: -1,   // 已播放动画的最高 settledRound（防重复播放）
   waitingPrompt: '',     // 状态栏提示文案
   roundSubmitted: false, // 本轮是否已提交（防止重复划屏）
@@ -54,11 +56,9 @@ let inputReady = false;     // input.init 防重复注册
 let watchStarted = false;   // watchRoom 防重复开启
 
 // =====================================================================
-//  初始化
+//  一次性初始化（不再包含入房逻辑）
 // =====================================================================
-function init(options) {
-  const opts = options || {};
-
+function init() {
   // ---- 1. 系统信息 + 画布（物理像素 = 逻辑像素 × dpr）----
   const sys = wx.getSystemInfoSync() || {};
   const windowWidth = sys.windowWidth || 375;
@@ -73,50 +73,61 @@ function init(options) {
   config.setScreen({ width: windowWidth, height: windowHeight, dpr });
   render.initRenderer(ctx, { width: canvas.width, height: canvas.height });
 
-  // ---- 2. 会话信息（优先显式传入，其次 Storage）----
-  session.roomId = opts.roomId || wx.getStorageSync('roomId') || '';
-  session.playerId = opts.playerId || wx.getStorageSync('playerId') || '';
-
-  // ---- 3. 手势模块 ----
+  // ---- 2. 手势模块 ----
   if (!inputReady) {
     input.init();
     input.setSwipeHandler(onSwipe);
     inputReady = true;
   }
 
-  // ---- 4. 有房间则拉取初始状态并开启实时监听 ----
-  if (session.roomId && session.playerId) {
-    cloud
-      .getRoom(session.roomId)
-      .then((resp) => {
-        if (cloud.isSuccess(resp) && resp.data && resp.data.room) {
-          const room = resp.data.room;
-          session.roundIndex = room.roundIndex || 0;
-          session.myRole =
-            room.playerA_Id === session.playerId
-              ? 'SHOOTER'
-              : room.playerB_Id === session.playerId
-                ? 'KEEPER'
-                : null;
-          // 若房间已有一笔结算，补足已播放游标，避免重放
-          if (room.lastResult && room.lastResult.settledRound != null) {
-            session.lastPlayedRound = room.lastResult.settledRound;
-          }
-          startWatch();
-        } else {
-          session.waitingPrompt = '房间加载失败';
-        }
-      })
-      .catch((err) => {
-        console.error('[bootstrap] getRoom failed', err);
-        session.waitingPrompt = '房间加载失败';
-      });
-  } else {
-    session.waitingPrompt = '未加入房间';
-  }
+  // ---- 3. 大厅提示（未入房）----
+  session.waitingPrompt = '匹配中，寻找对手…';
 
-  // ---- 5. 启动主循环 ----
+  // ---- 4. 启动主循环 ----
   mainLoop.start(frame);
+}
+
+// =====================================================================
+//  入房（matchManager 匹配成功后调用）
+// =====================================================================
+function joinGame({ roomId, playerId, role }) {
+  if (!roomId || !playerId) {
+    session.waitingPrompt = '入房参数缺失';
+    return;
+  }
+  session.roomId = roomId;
+  session.playerId = playerId;
+  session.mySide = role === 'B' ? 'B' : 'A';
+  session.roundSubmitted = false;
+  session.waitingPrompt = '房间加载中…';
+
+  cloud
+    .getRoom(roomId)
+    .then((resp) => {
+      if (cloud.isSuccess(resp) && resp.data && resp.data.room) {
+        const room = resp.data.room;
+        session.roundIndex = room.roundIndex || 0;
+        session.roundShooter = room.roundShooter || 'A';
+        session.score = room.score || { A: 0, B: 0 };
+        // 若房间已有一笔结算，补足已播放游标，避免重放
+        if (room.lastResult && room.lastResult.settledRound != null) {
+          session.lastPlayedRound = room.lastResult.settledRound;
+        }
+        startWatch();
+        session.waitingPrompt = '';
+      } else {
+        session.waitingPrompt = '房间加载失败';
+      }
+    })
+    .catch((err) => {
+      console.error('[bootstrap] getRoom failed', err);
+      session.waitingPrompt = '房间加载失败';
+    });
+}
+
+/** 设置大厅/提示文案（matchManager 使用） */
+function setHint(text) {
+  session.waitingPrompt = text || '';
 }
 
 // =====================================================================
@@ -164,6 +175,8 @@ function handleSubmitResp(resp, swipe) {
         // 我方触发了本轮结算（roundIndex 已 +1，settledRound = roundIndex - 1）
         session.roundSubmitted = false;
         session.roundIndex = data.roundIndex;
+        if (data.roundShooter) session.roundShooter = data.roundShooter;
+        if (data.score) session.score = data.score;
         // 防止 watch 与提交响应同时触发导致重复播放
         const settledRound = data.roundIndex - 1;
         if (settledRound > session.lastPlayedRound) {
@@ -234,7 +247,7 @@ function handleSubmitResp(resp, swipe) {
 }
 
 // =====================================================================
-//  实时监听（被动接收结算）
+//  实时监听（被动接收结算 + 同步 roundShooter/score）
 // =====================================================================
 function startWatch() {
   if (watchStarted || !session.roomId) return;
@@ -244,6 +257,8 @@ function startWatch() {
     session.roomId,
     (room) => {
       if (room.roundIndex != null) session.roundIndex = room.roundIndex;
+      if (room.roundShooter) session.roundShooter = room.roundShooter;
+      if (room.score) session.score = room.score;
 
       const lr = room.lastResult;
       const settledRound = lr && lr.settledRound;
@@ -285,8 +300,7 @@ function frame() {
   render.drawGoal();
 
   const st = stateMachine.getState();
-  const hint = session.waitingPrompt || baseHint();
-  render.drawStatusBar({ roundIndex: session.roundIndex, hint });
+  render.drawStatusBar({ roundIndex: session.roundIndex, hint: buildHint() });
 
   // 2. 动画中：推进时间轴并绘制
   if (st === State.ANIMATING && currentTimeline) {
@@ -324,13 +338,26 @@ function frame() {
   }
 }
 
-/** 按角色给出默认划屏提示 */
+/**
+ * 状态栏提示合成：未入房/大厅提示优先；已入房则「比分 · 划屏指引」。
+ */
+function buildHint() {
+  if (session.waitingPrompt) return session.waitingPrompt;
+  if (!session.roomId) return '未加入房间';
+  const sc = session.score || { A: 0, B: 0 };
+  return `${sc.A}:${sc.B} · ${baseHint()}`;
+}
+
+/** 按本回合攻守角色给出划屏指引（轮流射门，roundShooter 为准） */
 function baseHint() {
-  if (session.myRole === 'KEEPER') return '请划屏扑救';
-  return '请划屏射门';
+  const shooterIsA = (session.roundShooter || 'A') === 'A';
+  const iAmShooter = session.mySide === 'A' ? shooterIsA : !shooterIsA;
+  return iAmShooter ? '请划屏射门' : '请划屏扑救';
 }
 
 module.exports = {
   init,
+  joinGame,
+  setHint,
   getSession: () => session,
 };
