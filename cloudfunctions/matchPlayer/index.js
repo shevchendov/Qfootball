@@ -179,7 +179,6 @@ async function matchRandom(openid) {
         roomId: addRes._id,
         state: 'PLAYING',
         playerId: openid,
-        opponentId: other,
       };
     }
 
@@ -260,7 +259,7 @@ exports.main = async (event) => {
     console.error('[matchPlayer] error', err);
     const code = err && err.code ? err.code : ErrCode.INTERNAL;
     const msg = (err && err.msg) || 'internal_error';
-    return fail(code, msg, String((err && err.message) || err));
+    return fail(code, msg);
   }
 };
 

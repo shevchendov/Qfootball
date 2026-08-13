@@ -109,6 +109,7 @@ function start(mode) {
 
 /**
  * 断线重连：查房间状态分派。
+ * role 优先取本地 Storage 记录，其次用服务端鉴权后返回的 mySide。
  * @param {string} roomId
  */
 async function tryReconnect(roomId) {
@@ -117,14 +118,14 @@ async function tryReconnect(roomId) {
 
   if (resp && resp.code === 0 && resp.data && resp.data.room) {
     const room = resp.data.room;
+    const role = wx.getStorageSync(STORAGE_KEYS.ROLE) || resp.data.mySide || 'A';
     if (room.state === 'PLAYING' && playerId) {
-      const role = wx.getStorageSync(STORAGE_KEYS.ROLE) || (room.playerA_Id === playerId ? 'A' : 'B');
       bootstrap.joinGame({ roomId, playerId, role });
       return;
     }
     // state === 'FINISHED' → 清 Storage 回大厅
   }
-  // 房间不存在 / 其它异常 → 清 Storage 回大厅
+  // 房间不存在 / 无权限 / 其它异常 → 清 Storage 回大厅
   clearRoomStorage();
   bootstrap.showLobby();
 }

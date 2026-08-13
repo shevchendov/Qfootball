@@ -5,6 +5,12 @@
  *  运行环境 : Node.js 16.x + wx-server-sdk（微信云开发）
  *  职责     : 接收双端滑屏数据 → 计算力度/方向/档位 → 防重提交 → 双方齐后结算
  *
+ *  安全约定 :
+ *    - 玩家身份一律取自 wx.getWXContext().OPENID，忽略客户端上报的 playerId，
+ *      防止越权提交 / 冒充对手；
+ *    - GET_ROOM 仅房间内玩家可查，且响应剥离双方 openid，避免敏感信息泄露；
+ *    - 错误响应只返回业务码与文案，不透传内部异常细节。
+ *
  *  部署步骤 :
  *    1. 在微信开发者工具中，右键本目录 → 「上传并部署：云端安装依赖」
  *    2. 需先由「匹配/建房」云函数创建 rooms 文档，初始结构如下：
@@ -478,12 +484,13 @@ function settleRound(room, actionA, actionB) {
 
 /**
  * 提交动作主流程：参数校验 → 本地纯计算 → 事务提交/结算。
+ * 身份以调用上下文 openid 为准，忽略客户端传入的 playerId，防止越权/冒充。
  */
-async function handleSubmitAction(event) {
-  const { roomId, playerId, roundIndex, swipeData } = event;
+async function handleSubmitAction(event, openid) {
+  const { roomId, roundIndex, swipeData } = event;
 
   // 参数完整性校验
-  if (!roomId || !playerId || roundIndex === undefined || roundIndex === null || !swipeData) {
+  if (!roomId || !openid || roundIndex === undefined || roundIndex === null || !swipeData) {
     return fail(ErrCode.INVALID_PARAMS, 'invalid_params');
   }
 
@@ -512,7 +519,7 @@ async function handleSubmitAction(event) {
     lane,
   };
 
-  return await submitWithLock(roomId, playerId, clientRoundIndex, swipeRes);
+  return await submitWithLock(roomId, openid, clientRoundIndex, swipeRes);
 }
 
 /**
@@ -666,7 +673,6 @@ async function submitWithLock(roomId, playerId, clientRoundIndex, swipeRes) {
       return fail(
         isConflictError(err) ? ErrCode.SETTLE_CONFLICT : ErrCode.DB_ERROR,
         isConflictError(err) ? 'settle_conflict' : 'db_error',
-        String((err && err.message) || err),
       );
     }
   }
@@ -676,18 +682,38 @@ async function submitWithLock(roomId, playerId, clientRoundIndex, swipeRes) {
 
 /**
  * 查询房间（供客户端拉取 latest 状态，作为 watch 的兜底）。
+ * 鉴权：仅房间内玩家可查询；响应剥离双方 openid（playerA_Id/playerB_Id/action*.playerId）。
  */
-async function handleGetRoom(event) {
+async function handleGetRoom(event, openid) {
   const { roomId } = event;
   if (!roomId) return fail(ErrCode.INVALID_PARAMS, 'invalid_params');
 
   try {
     const snap = await db.collection('rooms').doc(roomId).get();
-    return ok({ room: snap.data });
+    const room = snap.data || {};
+
+    // 鉴权：只有房间内玩家（A/B 边）才能查询该房间
+    const mySide = getSide(room, openid);
+    if (!mySide) {
+      return fail(ErrCode.PLAYER_NOT_IN_ROOM, 'player_not_in_room');
+    }
+
+    // 剥离 openid，仅返回客户端对局所需的必要字段
+    const safeRoom = {
+      state: room.state,
+      roundIndex: room.roundIndex,
+      roundShooter: room.roundShooter,
+      score: room.score,
+      totalRounds: room.totalRounds,
+      suddenDeath: !!room.suddenDeath,
+      winner: room.winner,
+      lastResult: room.lastResult,
+    };
+    return ok({ room: safeRoom, mySide });
   } catch (err) {
     if (isNotFoundError(err)) return fail(ErrCode.ROOM_NOT_FOUND, 'room_not_found');
     console.error('[handleGetRoom] db error', err);
-    return fail(ErrCode.DB_ERROR, 'db_error', String((err && err.message) || err));
+    return fail(ErrCode.DB_ERROR, 'db_error');
   }
 }
 
@@ -704,21 +730,33 @@ exports.main = async (event) => {
     return fail(ErrCode.INVALID_PARAMS, 'invalid_event');
   }
 
+  // 权威身份：以微信调用上下文 openid 为准，绝不信任客户端传入的 playerId
+  let openid = '';
+  try {
+    const ctx = cloud.getWXContext();
+    openid = ctx.OPENID || '';
+  } catch (err) {
+    console.warn('[resolveRound] getWXContext failed', err);
+  }
+  if (!openid) {
+    return fail(ErrCode.INVALID_PARAMS, 'no_openid');
+  }
+
   const { action } = evt;
 
   try {
     switch (action) {
       case 'SUBMIT_ACTION':
-        return await handleSubmitAction(evt);
+        return await handleSubmitAction(evt, openid);
       case 'GET_ROOM':
-        return await handleGetRoom(evt);
+        return await handleGetRoom(evt, openid);
       default:
         return fail(ErrCode.UNKNOWN_ACTION, 'unknown_action', { action });
     }
   } catch (err) {
     // 兜底异常，避免未捕获异常导致云函数直接失败且无结构化返回
     console.error('[main] unhandled error', err);
-    return fail(ErrCode.INTERNAL, 'internal_error', String((err && err.message) || err));
+    return fail(ErrCode.INTERNAL, 'internal_error');
   }
 };
 
