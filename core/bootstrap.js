@@ -61,9 +61,15 @@ let conflictRetry = 0;      // 结算冲突重试计数
 let inputReady = false;     // input.init 防重复注册
 let watchStarted = false;   // watchRoom 防重复开启
 
+/** 是否处于"房间等待开局"态（WAITING / READY：已建房或已入房但未开局） */
+function isRoomWaiting() {
+  return session.gameState === 'WAITING' || session.gameState === 'READY';
+}
+
 // ---- 大厅/结算按钮回调（由 matchManager 注册）----
 const uiHandlers = {
-  onStart: null,   // 大厅「开始比赛」
+  onStart: null,   // 大厅「创建房间」
+  onStartMatch: null, // 房间等待态「开始比赛」
   onRematch: null, // 结算「再来一局」
   onHome: null,    // 结算「返回主页」
 };
@@ -101,6 +107,7 @@ function init() {
 /** 注册 UI 回调（大厅开始 / 再来一局 / 返回主页） */
 function setUiHandlers(handlers) {
   if (handlers && typeof handlers.onStart === 'function') uiHandlers.onStart = handlers.onStart;
+  if (handlers && typeof handlers.onStartMatch === 'function') uiHandlers.onStartMatch = handlers.onStartMatch;
   if (handlers && typeof handlers.onRematch === 'function') uiHandlers.onRematch = handlers.onRematch;
   if (handlers && typeof handlers.onHome === 'function') uiHandlers.onHome = handlers.onHome;
 }
@@ -153,11 +160,12 @@ function leaveRoom() {
 }
 
 /**
- * 入房（匹配成功 / 断线重连 / 再来一局后调用）。
+ * 入房（建房成功 / 加入成功 / 断线重连 / 再来一局后调用）。
+ * 房间模式约定：role 为 'HOST'（=边A）或 'GUEST'（=边B）。
  * 可重复调用：会自动复位 watchStarted 并重建监听。
  */
-function joinGame({ roomId, playerId, role }) {
-  if (!roomId || !playerId) {
+function joinGame({ roomId, role }) {
+  if (!roomId) {
     session.waitingPrompt = '入房参数缺失';
     return;
   }
@@ -166,8 +174,8 @@ function joinGame({ roomId, playerId, role }) {
   session.lobby = false;
   session.matching = false;
   session.roomId = roomId;
-  session.playerId = playerId;
-  session.mySide = role === 'B' ? 'B' : 'A';
+  session.playerId = ''; // 身份以云端 OPENID 为准，客户端不再需要 playerId
+  session.mySide = role === 'GUEST' ? 'B' : 'A';
   session.roundSubmitted = false;
   session.waitingPrompt = '房间加载中…';
 
@@ -206,8 +214,12 @@ function joinGame({ roomId, playerId, role }) {
 //  划屏 → 提交
 // =====================================================================
 async function onSwipe(swipe) {
-  if (session.lobby || !session.roomId || !session.playerId) {
-    session.waitingPrompt = session.lobby ? '请点击开始比赛' : '未加入房间';
+  if (session.lobby || !session.roomId) {
+    session.waitingPrompt = session.lobby ? '请点击创建房间' : '未加入房间';
+    return;
+  }
+  if (isRoomWaiting()) {
+    session.waitingPrompt = session.mySide === 'A' ? '等待好友加入，点击开始比赛' : '等待房主开局…';
     return;
   }
   if (session.roundSubmitted) {
@@ -394,6 +406,15 @@ function onTap(p) {
     }
     return;
   }
+  // 房间等待态：房主点击「开始比赛」
+  if (isRoomWaiting()) {
+    if (session.mySide === 'A' && uiHandlers.onStartMatch && hitTest(p, config.ROOM.btnStart)) {
+      uiHandlers.onStartMatch();
+    } else if (hitTest(p, config.ROOM.btnStart)) {
+      console.warn('[AABB] 仅房主可开始比赛');
+    }
+    return;
+  }
   // 结算弹窗态：命中「再来一局 / 返回主页」
   if (stateMachine.getState() === State.FINISHED) {
     if (uiHandlers.onRematch && hitTest(p, config.SETTLEMENT.btnRematch)) {
@@ -427,6 +448,16 @@ function frame() {
   if (session.lobby) {
     render.drawStatusBar({ roundIndex: '-', hint: session.waitingPrompt || '大厅' });
     render.drawLobby({ matching: session.matching });
+    return;
+  }
+
+  // ---- 房间等待态（建房/入房成功、开局前）----
+  if (isRoomWaiting()) {
+    render.drawStatusBar({ roundIndex: '-', hint: session.waitingPrompt || '房间等待中' });
+    render.drawRoomWait({
+      myRole: session.mySide === 'A' ? 'HOST' : 'GUEST',
+      hint: session.waitingPrompt,
+    });
     return;
   }
 

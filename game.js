@@ -9,7 +9,8 @@
  *       计算 scaleX/scaleY，确保坐标映射不为 NaN；
  *    4. bootstrap.init()：创建画布（render.initRender）、注册输入（注入缩放）、
  *       启动主循环；
- *    5. matchManager.start('random')：断线重连分派或进入大厅。
+ *    5. matchManager.start(queryRoomId)：解析分享卡片 roomId 分派入房，
+ *       否则进入大厅。
  *
  *  保证：所有 wx.* API 调用均发生在函数内且晚于入口执行，jsbridge 已就绪。
  * =====================================================================
@@ -32,5 +33,26 @@ render.initSystem();
 // ---- 4. 调度初始化：画布 / 输入（注入缩放）/ 主循环 ----
 bootstrap.init();
 
-// ---- 5. 断线重连分派或进入大厅 ----
-matchManager.start('random');
+// ---- 5. 解析分享卡片携带的房间 ID（冷启动）----
+function getLaunchRoomId() {
+  try {
+    const opts = wx.getLaunchOptionsSync();
+    return (opts && opts.query && opts.query.roomId) || '';
+  } catch (err) {
+    console.warn('[game] getLaunchOptionsSync failed', err);
+    return '';
+  }
+}
+
+// ---- 6. 热启动（分享卡片再次进入）实时监听 query 更新 ----
+try {
+  wx.onShow((res) => {
+    const roomId = (res && res.query && res.query.roomId) || '';
+    if (roomId) matchManager.joinRoom(roomId);
+  });
+} catch (err) {
+  console.warn('[game] wx.onShow 注册失败', err);
+}
+
+// ---- 7. 分派：有邀请房间 → 入房；否则进入大厅 ----
+matchManager.start(getLaunchRoomId());

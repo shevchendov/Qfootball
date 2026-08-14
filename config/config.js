@@ -178,7 +178,15 @@ const LOBBY = {
   titleY: 400,
   subtitle: '实时对战 · 盲盒点球',
   subtitleY: 490,
-  btnStart: { x: 225, y: 900, w: 300, h: 100 },   // 开始比赛
+  btnStart: { x: 225, y: 900, w: 300, h: 100 },   // 创建房间
+};
+
+// 房间等待态（建房/入房成功 → 开局前）
+const ROOM = {
+  title: '房间已就绪',
+  titleY: 700,
+  hintY: 790,                                      // 等待提示文案 y
+  btnStart: { x: 225, y: 900, w: 300, h: 100 },   // 开始比赛（仅房主）
 };
 
 // =====================================================================
@@ -232,6 +240,7 @@ module.exports = {
   RESULT_ANIM,
   SETTLEMENT,
   LOBBY,
+  ROOM,
   ErrCode,
   ERROR_MSG,
 };

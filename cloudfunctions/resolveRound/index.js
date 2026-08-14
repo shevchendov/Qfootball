@@ -381,8 +381,14 @@ function isNotFoundError(err) {
   return code === -502004 || /not exist|不存在|does not exist/i.test(msg);
 }
 
-/** 判断玩家所属边，返回 'A' | 'B' | null（攻守角色由 roundShooter 动态决定） */
+/**
+ * 判断玩家所属边，返回 'A' | 'B' | null（攻守角色由 roundShooter 动态决定）。
+ * 房间模式约定：hostId=边A（建房者），guestId=边B（入房者）。
+ * 向后兼容旧房间字段 playerA_Id/playerB_Id。
+ */
 function getSide(room, playerId) {
+  if (room.hostId && room.hostId === playerId) return 'A';
+  if (room.guestId && room.guestId === playerId) return 'B';
   if (room.playerA_Id && room.playerA_Id === playerId) return 'A';
   if (room.playerB_Id && room.playerB_Id === playerId) return 'B';
   return null;

@@ -27,6 +27,7 @@ const {
   COLORS,
   SETTLEMENT,
   LOBBY,
+  ROOM,
 } = config;
 
 // 兜底屏幕参数（wx.getSystemInfoSync 异常时使用，保证 scaleX/scaleY 永不为 NaN）
@@ -632,17 +633,51 @@ function drawLobby(info) {
   ctx.fillText(LOBBY.subtitle, DESIGN_W / 2, LOBBY.subtitleY);
   ctx.restore();
 
-  // 匹配中：显示等待文案；否则显示「开始比赛」按钮
+  // 匹配中：显示等待文案；否则显示「创建房间」按钮
   if (data.matching) {
     ctx.save();
     ctx.font = 'bold 36px sans-serif';
     ctx.textAlign = 'center';
     ctx.textBaseline = 'middle';
     ctx.fillStyle = '#ffffff';
-    ctx.fillText('匹配中，寻找对手…', DESIGN_W / 2, LOBBY.btnStart.y + LOBBY.btnStart.h / 2);
+    ctx.fillText(data.matchingText || '创建房间中…', DESIGN_W / 2, LOBBY.btnStart.y + LOBBY.btnStart.h / 2);
     ctx.restore();
   } else {
-    drawButton(LOBBY.btnStart, '开始比赛', '#3a9d4b');
+    drawButton(LOBBY.btnStart, '创建房间', '#3a9d4b');
+  }
+}
+
+// 房间等待态：建房/入房成功后、开局前
+// info: { myRole: 'HOST'|'GUEST', hint: string }（HOST 显示开始按钮）
+function drawRoomWait(info) {
+  if (!ctx) return;
+  const data = info || {};
+  const isHost = data.myRole === 'HOST';
+
+  // 标题
+  ctx.save();
+  ctx.font = 'bold 48px sans-serif';
+  ctx.textAlign = 'center';
+  ctx.textBaseline = 'middle';
+  ctx.lineWidth = 8;
+  ctx.strokeStyle = 'rgba(0,0,0,0.55)';
+  ctx.strokeText(ROOM.title, DESIGN_W / 2, ROOM.titleY);
+  ctx.fillStyle = '#ffd93b';
+  ctx.fillText(ROOM.title, DESIGN_W / 2, ROOM.titleY);
+  ctx.restore();
+
+  // 等待提示
+  ctx.save();
+  ctx.font = '30px sans-serif';
+  ctx.textAlign = 'center';
+  ctx.textBaseline = 'middle';
+  ctx.fillStyle = 'rgba(255,255,255,0.85)';
+  ctx.fillText(data.hint || (isHost ? '等待好友加入…' : '等待房主开局…'), DESIGN_W / 2, ROOM.hintY);
+  ctx.restore();
+
+  // 房主显示「开始比赛」按钮（访客等待房主开局，不显示）
+  if (isHost) {
+    drawButton(ROOM.btnStart, '开始比赛', '#3a9d4b');
   }
 }
 

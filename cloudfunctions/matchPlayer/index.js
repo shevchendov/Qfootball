@@ -1,49 +1,61 @@
 /**
  * =====================================================================
- *  匹配/建房云函数（matchPlayer）
+ *  匹配/建房云函数（matchPlayer）· 房间邀请模式
  * =====================================================================
  *  运行环境 : Node.js 16.x + wx-server-sdk（微信云开发）
- *  职责     : 提供随机匹配与匹配状态查询。
+ *  职责     : 房主建房 → 分享 → 访客入房 → 房主开局 的完整生命周期。
  *
- *  action 支持：
- *    MATCH_RANDOM : 通过 matchPool 单文档配对池原子匹配。
- *                   占位成功 → role='A'（等待），配对成功 → role='B'（建房 PLAYING）。
- *    GET_STATUS   : 供等待方（role='A'）轮询，反查 rooms 集合中
- *                   playerA_Id==我 且 state=='PLAYING' 的最新房间。
- *    CANCEL       : 等待方取消匹配（清理自己的池占位）。
+ *  action 支持（Phase 4 决议）：
+ *    CREATE_ROOM : 创建 rooms 文档，state='WAITING'，hostId=OPENID，返回 roomId。
+ *    JOIN_ROOM   : 访客原子占位入房（乐观锁条件更新），成功置 state='READY'；
+ *                  失败返回友好报错；处理「房主重进自己房间」「退出旧房间加入新房间」。
+ *    START_GAME  : 鉴权必须是房主且 state='READY'，重置对局字段并置 state='PLAYING'。
+ *    LEAVE_ROOM  : 房主离开 → 'DISBANDED'；访客离开 → 'WAITING' 且腾出空位。
  *
- *  原子性原理（Gemini 拍板：matchPool 单文档配对池）：
- *    占位与清空均使用「条件更新」：
- *      where({_id:'pool', waiter: exists(false)}).update(...)   —— 只有池空时我才能占位
- *      where({_id:'pool', waiter: other}).update(...)           —— 只有匹配到我才清空配对
- *    二者天然串行，彻底避免「两人同时建房 / 两人抢同一房间」。
+ *  并发防抢房（DevSecOps 卡点）：
+ *    访客入房使用「条件更新」—— 仅当 guestId 字段不存在时才能占位：
+ *      where({ _id: roomId, guestId: _.exists(false) })
+ *      .update({ data: { guestId: openid, state: 'READY' } })
+ *    该操作在数据库服务端原子执行，B、C 同时点击同一张分享卡片时，
+ *    系统保证只有一条 update 影响行数为 1，另一条 updated=0 收到「房间已满」。
  *
- *  需预先初始化 matchPool 集合及单文档：{ _id:'pool' }
- *  （本函数会惰性兜底创建，重复创建冲突自动忽略）。
+ *  身份安全：所有 action 的 openid 一律取自 wx.getWXContext().OPENID，
+ *    不信任客户端传入的身份字段（沿用上一阶段安全加固）。
+ *
+ *  可测性：核心处理器以 db 为参数注入（main 内取真实 db，单测传桩），
+ *    纯逻辑 buildRoomDoc 导出便于单测。
  * =====================================================================
  */
 const cloud = require('wx-server-sdk');
 
 cloud.init({ env: cloud.DYNAMIC_CURRENT_ENV });
 
-const db = cloud.database();
-const _ = db.command;
-
 // ---- 错误码 ----
 const ErrCode = Object.freeze({
   OK: 0,
   INVALID_PARAMS: 1001,
-  MATCH_BUSY: 1201,   // 匹配繁忙（重试耗尽）
+  ROOM_NOT_FOUND: 1006,
+  PLAYER_NOT_IN_ROOM: 1002,
+  ROOM_FULL: 2002,     // 房间已满（访客占位失败）
+  ROOM_CLOSED: 2003,   // 房间已开始 / 已结束 / 已解散
+  NOT_HOST: 2004,      // 非房主无权开局
+  ROOM_NOT_READY: 2005, // 房间未就绪（缺少访客）
   DB_ERROR: 5000,
   INTERNAL: 5001,
 });
 
 // ---- 常量 ----
-const POOL_ID = 'pool';           // 配对池固定文档 ID
-const MATCH_POOL_COLL = 'matchPool';
 const ROOMS_COLL = 'rooms';
-const MATCH_RETRY = 3;            // 占位/清空重试次数
-const TOTAL_ROUNDS = 10;          // 单场总踢球数（各 5 次）
+const TOTAL_ROUNDS = 10; // 单场总踢球数（各 5 次）
+
+// 房间生命周期状态
+const ROOM_STATES = Object.freeze({
+  WAITING: 'WAITING',       // 已创建，仅房主，等待好友
+  READY: 'READY',           // 双方就绪，等待房主开局
+  PLAYING: 'PLAYING',       // 对局进行中
+  FINISHED: 'FINISHED',     // 分出胜负
+  DISBANDED: 'DISBANDED',   // 房主离开 / 异常回收
+});
 
 // =====================================================================
 //  工具
@@ -58,14 +70,6 @@ function fail(code, msg, detail) {
   return body;
 }
 
-/** 构造带业务码的异常 */
-function createError(code, msg) {
-  const err = new Error(msg);
-  err.code = code;
-  err.msg = msg;
-  return err;
-}
-
 /** 判断是否"文档不存在"错误 */
 function isNotFoundError(err) {
   const msg = String((err && (err.errMsg || err.message)) || '');
@@ -74,39 +78,24 @@ function isNotFoundError(err) {
 }
 
 /**
- * 确保配对池文档存在（单文档 _id='pool'）。
- * 并发创建冲突（_id 重复）忽略，视为已存在。
+ * 构造房间文档初始数据（房间邀请模式）。
+ * 注意：guestId 字段在访客入房前【不存在】——「字段不存在」即空位，
+ * 与乐观锁条件 `guestId: _.exists(false)` 保持一致（null 会让 exists(false) 失效）。
  */
-async function ensurePoolDoc() {
-  try {
-    await db.collection(MATCH_POOL_COLL).doc(POOL_ID).get();
-    return;
-  } catch (err) {
-    if (!isNotFoundError(err)) throw err;
-  }
-  try {
-    await db.collection(MATCH_POOL_COLL).add({ data: { _id: POOL_ID } });
-  } catch (err2) {
-    // _id 冲突：并发下可能已被创建，忽略
-    if (!isNotFoundError(err2)) {
-      // 非"已存在"类错误仍记录
-      console.warn('[matchPlayer] ensurePoolDoc add conflict', err2.errMsg || err2.message);
-    }
-  }
-}
-
-/** 构造房间文档初始数据 */
-function createRoomDoc(playerA, playerB, now) {
+function buildRoomDoc(hostId, now) {
   return {
-    state: 'PLAYING',
-    playerA_Id: playerA,
-    playerB_Id: playerB,
+    roomType: 'INVITE',
+    state: ROOM_STATES.WAITING,
+    hostId,                     // 房主 openid（对局固定为 A）
+    // guestId 缺席 = 空位，访客入房后写入（对局固定为 B）
     roundIndex: 0,
-    roundShooter: 'A',      // 首轮由建房者（A）先射门
+    roundShooter: 'A',          // 首轮房主（A）射门
     score: { A: 0, B: 0 },
     totalRounds: TOTAL_ROUNDS,
     actionA: null,
     actionB: null,
+    suddenDeath: false,
+    winner: null,
     lastResult: null,
     createTime: now,
     updateTime: now,
@@ -114,128 +103,228 @@ function createRoomDoc(playerA, playerB, now) {
 }
 
 // =====================================================================
-//  匹配核心：MATCH_RANDOM
+//  业务：CREATE_ROOM
 // =====================================================================
 /**
- * 随机匹配。
- * @param {string} openid 当前玩家 openid
- * @returns 占位成功: { matched:false, role:'A', state:'WAITING' }
- *          配对成功: { matched:true, role:'B', roomId, state:'PLAYING' }
+ * 房主建房。
+ * 幂等：若该房主已有活跃房间（WAITING/READY/PLAYING），直接返回既有房间，
+ * 避免重复点击「创建房间」产生多个空房。
+ * @param {*} db 数据库实例
+ * @param {string} openid 房主 openid
+ * @returns {{roomId:string, state:string, recreated:boolean}}
  */
-async function matchRandom(openid) {
+async function createRoom(db, openid) {
+  const _ = db.command;
   const now = Date.now();
 
-  for (let attempt = 0; attempt < MATCH_RETRY; attempt++) {
-    // ---- 1. 尝试占位：池空才能占位 ----
-    const claim = await db
-      .collection(MATCH_POOL_COLL)
-      .where({ _id: POOL_ID, waiter: _.exists(false) })
-      .update({ data: { waiter: openid, waiterTime: now } });
-
-    if (claim.stats && claim.stats.updated === 1) {
-      // 我成为等待者 → 我是 A
-      return { matched: false, role: 'A', roomId: null, state: 'WAITING', playerId: openid };
-    }
-
-    // ---- 2. 池有等待者（或池文档缺失）→ 读取 ----
-    let pool = null;
-    try {
-      const snap = await db.collection(MATCH_POOL_COLL).doc(POOL_ID).get();
-      pool = snap.data || {};
-    } catch (err) {
-      if (isNotFoundError(err)) {
-        await ensurePoolDoc();
-        continue; // 建池后重试占位
-      }
-      throw err;
-    }
-
-    const other = pool.waiter;
-
-    // 自己在池中（重复调用）→ 幂等返回等待
-    if (other === openid) {
-      return { matched: false, role: 'A', roomId: null, state: 'WAITING', playerId: openid };
-    }
-
-    // 池被并发清空 → 重试占位
-    if (!other) {
-      continue;
-    }
-
-    // ---- 3. 尝试清空配对：只有匹配到 other 才能清空 ----
-    const clear = await db
-      .collection(MATCH_POOL_COLL)
-      .where({ _id: POOL_ID, waiter: other })
-      .update({ data: { waiter: _.remove(), waiterTime: _.remove() } });
-
-    if (clear.stats && clear.stats.updated === 1) {
-      // ---- 4. 配对成功 → 建房（other=A 建房者，我=B 加入者）----
-      const addRes = await db.collection(ROOMS_COLL).add({
-        data: createRoomDoc(other, openid, Date.now()),
-      });
-      return {
-        matched: true,
-        role: 'B',
-        roomId: addRes._id,
-        state: 'PLAYING',
-        playerId: openid,
-      };
-    }
-
-    // 清空被并发抢先 → 重试
-  }
-
-  throw createError(ErrCode.MATCH_BUSY, 'match_busy');
-}
-
-// =====================================================================
-//  匹配状态查询：GET_STATUS（供等待方 role='A' 轮询）
-// =====================================================================
-/**
- * 反查等待方（A）是否已被配对建房。
- * @param {string} openid
- * @returns { matched, roomId, state, role, playerId }
- */
-async function getStatus(openid) {
-  const res = await db
+  // 幂等：查房主现存活跃房间
+  const active = await db
     .collection(ROOMS_COLL)
-    .where({ playerA_Id: openid, state: 'PLAYING' })
-    .orderBy('updateTime', 'desc')
-    .limit(1)
+    .where({ hostId: openid, state: _.in([ROOM_STATES.WAITING, ROOM_STATES.READY, ROOM_STATES.PLAYING]) })
     .get();
 
-  const doc = res.data && res.data[0];
-  if (doc && doc._id) {
-    return {
-      matched: true,
-      roomId: doc._id,
-      state: 'PLAYING',
-      role: 'A',
-      playerId: openid,
-    };
+  const existing = active.data && active.data[0];
+  if (existing && existing._id) {
+    return ok({ roomId: existing._id, state: existing.state, recreated: false });
   }
-  return { matched: false, roomId: null, state: 'WAITING', role: 'A', playerId: openid };
+
+  // 新建房间（_id 由 add 自动生成，作为分享 query 使用）
+  const addRes = await db.collection(ROOMS_COLL).add({ data: buildRoomDoc(openid, now) });
+  return ok({ roomId: addRes._id, state: ROOM_STATES.WAITING, recreated: true });
 }
 
 // =====================================================================
-//  取消匹配：CANCEL
+//  业务：JOIN_ROOM（并发防抢房核心）
 // =====================================================================
-async function cancelMatch(openid) {
-  // 仅当池中等待者仍是我时才清理，避免误伤他人占位
+/**
+ * 清理该用户在其它房间的占位（「退出旧房间加入新房间」边界）。
+ *  - 若他是其它 WAITING/READY 房的房主 → 解散旧房；
+ *  - 若他是其它 WAITING 房的访客 → 腾出空位（guestId 移除，回到可加入）。
+ * 均为尽力而为（best-effort），不影响本房间占位结果。
+ */
+async function leaveOtherInvolvement(db, openid, roomId, _) {
   await db
-    .collection(MATCH_POOL_COLL)
-    .where({ _id: POOL_ID, waiter: openid })
-    .update({ data: { waiter: _.remove(), waiterTime: _.remove() } });
-  return { cancelled: true };
+    .collection(ROOMS_COLL)
+    .where({ hostId: openid, state: _.in([ROOM_STATES.WAITING, ROOM_STATES.READY]), _id: _.neq(roomId) })
+    .update({ data: { state: ROOM_STATES.DISBANDED, updateTime: Date.now() } });
+
+  await db
+    .collection(ROOMS_COLL)
+    .where({ guestId: openid, state: ROOM_STATES.WAITING, _id: _.neq(roomId) })
+    .update({ data: { guestId: _.remove(), updateTime: Date.now() } });
+}
+
+/**
+ * 访客入房（原子占位）。
+ * @param {*} db 数据库实例
+ * @param {string} openid 访客 openid
+ * @param {string} roomId 目标房间 ID
+ * @returns {roomId, state, role}
+ */
+async function joinRoom(db, openid, roomId) {
+  const _ = db.command;
+  if (!roomId || !openid) return fail(ErrCode.INVALID_PARAMS, 'invalid_params');
+
+  // ---- 1. 读取房间（非事务读，仅前置校验与友好提示）----
+  let room;
+  try {
+    const snap = await db.collection(ROOMS_COLL).doc(roomId).get();
+    room = snap.data;
+  } catch (err) {
+    if (isNotFoundError(err)) return fail(ErrCode.ROOM_NOT_FOUND, '房间不存在');
+    console.error('[joinRoom] read room error', err);
+    return fail(ErrCode.DB_ERROR, 'db_error');
+  }
+
+  // ---- 2. 房主重进自己房间 → 幂等返回 ----
+  if (room.hostId === openid) {
+    return ok({ roomId, state: room.state, role: 'HOST' });
+  }
+  // ---- 3. 自己已是该房访客 → 幂等返回 ----
+  if (room.guestId === openid) {
+    return ok({ roomId, state: room.state, role: 'GUEST' });
+  }
+  // ---- 4. 生命周期校验（优先级高于"已满"）：已开始/已结束/已解散不可入 ----
+  if (room.state === ROOM_STATES.PLAYING || room.state === ROOM_STATES.FINISHED || room.state === ROOM_STATES.DISBANDED) {
+    return fail(ErrCode.ROOM_CLOSED, '房间已开始或已结束');
+  }
+  // ---- 5. 房间已满：guest 位已被他人占用 ----
+  if (room.guestId != null) {
+    return fail(ErrCode.ROOM_FULL, '房间已满');
+  }
+  // ---- 6. 状态兜底：非 WAITING（如异常 READY 无 guest）不可入 ----
+  if (room.state !== ROOM_STATES.WAITING) {
+    return fail(ErrCode.ROOM_CLOSED, '房间不可加入');
+  }
+
+  // ---- 7. 退出旧房间加入新房间：清理该用户在其它房的占位 ----
+  await leaveOtherInvolvement(db, openid, roomId, _);
+
+  // ---- 8. 原子占位（乐观锁）：仅当 guestId 不存在时才能写入 ----
+  const res = await db
+    .collection(ROOMS_COLL)
+    .where({ _id: roomId, guestId: _.exists(false) })
+    .update({
+      data: {
+        guestId: openid,
+        state: ROOM_STATES.READY,
+        updateTime: Date.now(),
+      },
+    });
+
+  const updated = res && res.stats ? res.stats.updated : 0;
+  if (updated !== 1) {
+    // 条件不满足 → 空位已被并发抢占，或房间已非 WAITING
+    return fail(ErrCode.ROOM_FULL, '房间已满');
+  }
+
+  return ok({ roomId, state: ROOM_STATES.READY, role: 'GUEST' });
+}
+
+// =====================================================================
+//  业务：START_GAME
+// =====================================================================
+/**
+ * 房主开局。
+ * 鉴权：必须为房主（hostId===openid）且房间 state==='READY'（访客已在）。
+ * 重置对局字段（roundIndex=0, score={A:0,B:0}, roundShooter='A'）并置 PLAYING。
+ */
+async function startGame(db, openid, roomId) {
+  if (!roomId || !openid) return fail(ErrCode.INVALID_PARAMS, 'invalid_params');
+
+  let room;
+  try {
+    const snap = await db.collection(ROOMS_COLL).doc(roomId).get();
+    room = snap.data;
+  } catch (err) {
+    if (isNotFoundError(err)) return fail(ErrCode.ROOM_NOT_FOUND, '房间不存在');
+    console.error('[startGame] read room error', err);
+    return fail(ErrCode.DB_ERROR, 'db_error');
+  }
+
+  // 鉴权：仅房主可开局
+  if (room.hostId !== openid) {
+    return fail(ErrCode.NOT_HOST, '仅房主可开始比赛');
+  }
+  // 状态：必须双方就绪
+  if (room.state !== ROOM_STATES.READY) {
+    return fail(ErrCode.ROOM_NOT_READY, '房间未就绪（需好友加入）');
+  }
+
+  // 重置对局数据并置 PLAYING（后续回合由 resolveRound 接管）
+  await db.collection(ROOMS_COLL).doc(roomId).update({
+    data: {
+      state: ROOM_STATES.PLAYING,
+      roundIndex: 0,
+      roundShooter: 'A',
+      score: { A: 0, B: 0 },
+      actionA: null,
+      actionB: null,
+      suddenDeath: false,
+      winner: null,
+      lastResult: null,
+      updateTime: Date.now(),
+    },
+  });
+
+  return ok({ roomId, state: ROOM_STATES.PLAYING });
+}
+
+// =====================================================================
+//  业务：LEAVE_ROOM
+// =====================================================================
+/**
+ * 离开房间。
+ *  - 房主离开 → 房间置 DISBANDED（访客 watch 到后提示「房主已离开」）；
+ *  - 访客离开 → 房间回 WAITING 并腾出空位（guestId 移除，下一好友可加入）。
+ */
+async function leaveRoom(db, openid, roomId) {
+  const _ = db.command;
+  if (!roomId || !openid) return fail(ErrCode.INVALID_PARAMS, 'invalid_params');
+
+  let room;
+  try {
+    const snap = await db.collection(ROOMS_COLL).doc(roomId).get();
+    room = snap.data;
+  } catch (err) {
+    if (isNotFoundError(err)) return fail(ErrCode.ROOM_NOT_FOUND, '房间不存在');
+    console.error('[leaveRoom] read room error', err);
+    return fail(ErrCode.DB_ERROR, 'db_error');
+  }
+
+  // 房主离开 → 解散
+  if (room.hostId === openid) {
+    await db.collection(ROOMS_COLL).doc(roomId).update({
+      data: { state: ROOM_STATES.DISBANDED, updateTime: Date.now() },
+    });
+    return ok({ roomId, state: ROOM_STATES.DISBANDED, action: 'DISBAND' });
+  }
+
+  // 访客离开 → 回 WAITING、腾出空位（remove 保证下一次 exists(false) 可占位）
+  if (room.guestId === openid) {
+    await db.collection(ROOMS_COLL).doc(roomId).update({
+      data: { state: ROOM_STATES.WAITING, guestId: _.remove(), updateTime: Date.now() },
+    });
+    return ok({ roomId, state: ROOM_STATES.WAITING, action: 'LEAVE' });
+  }
+
+  return fail(ErrCode.PLAYER_NOT_IN_ROOM, '你不在该房间');
 }
 
 // =====================================================================
 //  云函数入口
 // =====================================================================
 exports.main = async (event) => {
-  const evt = event || {};
-  const action = evt.action;
+  // 兜底：极小概率 event 为字符串（异常调用）
+  let evt = event;
+  if (typeof evt === 'string') {
+    try { evt = JSON.parse(evt); } catch (_e) { /* 保持原样，后续校验拦截 */ }
+  }
+  if (!evt || typeof evt !== 'object') {
+    return fail(ErrCode.INVALID_PARAMS, 'invalid_event');
+  }
 
+  // 权威身份：取自微信调用上下文，绝不信任客户端传入的 openid
   let openid = '';
   try {
     const ctx = cloud.getWXContext();
@@ -243,28 +332,40 @@ exports.main = async (event) => {
   } catch (err) {
     console.warn('[matchPlayer] getWXContext failed', err);
   }
+  if (!openid) {
+    return fail(ErrCode.INVALID_PARAMS, 'no_openid');
+  }
+
+  const db = cloud.database();
+  const { action, roomId } = evt;
 
   try {
     switch (action) {
-      case 'MATCH_RANDOM':
-        return ok(await matchRandom(openid));
-      case 'GET_STATUS':
-        return ok(await getStatus(openid));
-      case 'CANCEL':
-        return ok(await cancelMatch(openid));
+      case 'CREATE_ROOM':
+        return await createRoom(db, openid);
+      case 'JOIN_ROOM':
+        return await joinRoom(db, openid, roomId);
+      case 'START_GAME':
+        return await startGame(db, openid, roomId);
+      case 'LEAVE_ROOM':
+        return await leaveRoom(db, openid, roomId);
       default:
         return fail(ErrCode.INVALID_PARAMS, 'unknown_action', { action });
     }
   } catch (err) {
+    // 兜底异常，避免未捕获异常导致云函数直接失败且无结构化返回
     console.error('[matchPlayer] error', err);
-    const code = err && err.code ? err.code : ErrCode.INTERNAL;
-    const msg = (err && err.msg) || 'internal_error';
-    return fail(code, msg);
+    return fail(ErrCode.INTERNAL, 'internal_error');
   }
 };
 
-// 导出核心逻辑，便于本地单测
-exports.matchRandom = matchRandom;
-exports.getStatus = getStatus;
-exports.cancelMatch = cancelMatch;
-exports.createRoomDoc = createRoomDoc;
+// 导出核心逻辑（db 以参数注入），便于本地单测
+exports.createRoom = createRoom;
+exports.joinRoom = joinRoom;
+exports.startGame = startGame;
+exports.leaveRoom = leaveRoom;
+exports.leaveOtherInvolvement = leaveOtherInvolvement;
+exports.buildRoomDoc = buildRoomDoc;
+exports.isNotFoundError = isNotFoundError;
+exports.ErrCode = ErrCode;
+exports.ROOM_STATES = ROOM_STATES;
