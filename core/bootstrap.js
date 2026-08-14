@@ -456,6 +456,7 @@ function frame() {
     render.drawStatusBar({ roundIndex: '-', hint: session.waitingPrompt || '房间等待中' });
     render.drawRoomWait({
       myRole: session.mySide === 'A' ? 'HOST' : 'GUEST',
+      gameState: session.gameState,
       hint: session.waitingPrompt,
     });
     return;

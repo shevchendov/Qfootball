@@ -648,11 +648,14 @@ function drawLobby(info) {
 }
 
 // 房间等待态：建房/入房成功后、开局前
-// info: { myRole: 'HOST'|'GUEST', hint: string }（HOST 显示开始按钮）
+// info: { myRole: 'HOST'|'GUEST', gameState: 'WAITING'|'READY', hint: string }
+//   - WAITING：等待好友加入（房主可再分享）
+//   - READY  ：好友已就绪，房主显示「开始比赛」按钮（与 config.ROOM.btnStart AABB 对齐）
 function drawRoomWait(info) {
   if (!ctx) return;
   const data = info || {};
   const isHost = data.myRole === 'HOST';
+  const gameState = data.gameState || 'WAITING';
 
   // 标题
   ctx.save();
@@ -666,17 +669,26 @@ function drawRoomWait(info) {
   ctx.fillText(ROOM.title, DESIGN_W / 2, ROOM.titleY);
   ctx.restore();
 
-  // 等待提示
+  // 等待提示（优先级：外部传入 hint > 按状态/角色默认文案）
+  let hint = data.hint;
+  if (!hint) {
+    if (gameState === 'READY') {
+      hint = isHost ? '好友已就绪，点击开始比赛' : '好友已就绪，等待房主开局…';
+    } else {
+      hint = isHost ? '等待好友加入，可再次分享' : '等待房主开局…';
+    }
+  }
+
   ctx.save();
   ctx.font = '30px sans-serif';
   ctx.textAlign = 'center';
   ctx.textBaseline = 'middle';
   ctx.fillStyle = 'rgba(255,255,255,0.85)';
-  ctx.fillText(data.hint || (isHost ? '等待好友加入…' : '等待房主开局…'), DESIGN_W / 2, ROOM.hintY);
+  ctx.fillText(hint, DESIGN_W / 2, ROOM.hintY);
   ctx.restore();
 
-  // 房主显示「开始比赛」按钮（访客等待房主开局，不显示）
-  if (isHost) {
+  // 仅房主且好友已就绪（READY）时显示「开始比赛」按钮
+  if (isHost && gameState === 'READY') {
     drawButton(ROOM.btnStart, '开始比赛', '#3a9d4b');
   }
 }
@@ -698,4 +710,5 @@ module.exports = {
   drawFx,
   drawSettlement,
   drawLobby,
+  drawRoomWait,
 };
