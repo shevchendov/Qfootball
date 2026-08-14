@@ -60,6 +60,7 @@ let roundEnd = 0;           // NEXT_ROUND 进入时间
 let conflictRetry = 0;      // 结算冲突重试计数
 let inputReady = false;     // input.init 防重复注册
 let watchStarted = false;   // watchRoom 防重复开启
+let pollTimer = null;       // 房间状态轮询定时器（watch 失效兜底）
 
 /** 是否处于"房间等待开局"态（WAITING / READY：已建房或已入房但未开局） */
 function isRoomWaiting() {
@@ -138,6 +139,7 @@ function leaveRoom() {
   }
   watcher = null;
   watchStarted = false;
+  stopPolling();
 
   session.lobby = true;
   session.matching = false;
@@ -195,6 +197,7 @@ function joinGame({ roomId, role }) {
           session.lastPlayedRound = room.lastResult.settledRound;
         }
         startWatch();
+        startPolling(); // watch + 轮询双保险：确保房主感知访客入房 READY
         session.waitingPrompt = '';
         // 防御：房间已是 FINISHED → 直接进结算弹窗态
         if (session.gameState === 'FINISHED') {
@@ -336,37 +339,128 @@ function handleSubmitResp(resp, swipe) {
 
 // =====================================================================
 //  实时监听（被动接收结算 + 同步 roundShooter/score/胜负）
+//  双保险：db.watch 为主 + setInterval 轮询兜底（watch 在真机可能因
+//  权限/网络静默失效，轮询确保房主能感知访客入房 READY）。
 // =====================================================================
+
+/** 房间轮询间隔（ms） */
+const POLL_INTERVAL = 2000;
+
+/**
+ * 统一同步房间字段到本地 session（watch / 轮询 / 提交响应共用）。
+ * 返回是否发生了关键状态变化（供调用方决定重绘）。
+ */
+function syncRoomState(room) {
+  let changed = false;
+  if (room.roundIndex != null && room.roundIndex !== session.roundIndex) {
+    session.roundIndex = room.roundIndex;
+    changed = true;
+  }
+  if (room.roundShooter && room.roundShooter !== session.roundShooter) {
+    session.roundShooter = room.roundShooter;
+    changed = true;
+  }
+  if (room.score && JSON.stringify(room.score) !== JSON.stringify(session.score)) {
+    session.score = room.score;
+    changed = true;
+  }
+  if (room.suddenDeath != null && room.suddenDeath !== session.suddenDeath) {
+    session.suddenDeath = room.suddenDeath;
+    changed = true;
+  }
+  if (room.state && room.state !== session.gameState) {
+    session.gameState = room.state;
+    changed = true;
+  }
+  if (room.winner && room.winner !== session.winner) {
+    session.winner = room.winner;
+    changed = true;
+  }
+  return changed;
+}
+
+/**
+ * 处理一条新的房间快照（watch / 轮询）：
+ * 同步状态 → 触发补动画 / 进入结算弹窗。
+ */
+function applyRoomSnapshot(room) {
+  if (!room) return;
+  const changed = syncRoomState(room);
+
+  // 状态变化 → 强制重绘（主循环持续运行，更新 gameState 后下一帧即生效）
+  if (changed) {
+    // 关键：等待态 WAITING→READY 时房主端立即渲染「开始比赛」按钮
+    session.waitingPrompt = '';
+  }
+
+  const lr = room.lastResult;
+  const settledRound = lr && lr.settledRound;
+  if (settledRound != null && settledRound > session.lastPlayedRound) {
+    const st = stateMachine.getState();
+    // 当前不在动画中才触发（已在动画中的结果由提交响应处理）
+    if (st !== State.ANIMATING && st !== State.NEXT_ROUND) {
+      session.roundSubmitted = false;
+      startAnimation(lr, settledRound);
+      return;
+    }
+  }
+
+  // 房主端感知到 READY → 提示可开局；任意端感知 FINISHED → 结算弹窗
+  if (session.gameState === 'READY' && session.mySide === 'A' && session.lobby === false) {
+    session.waitingPrompt = '好友已就绪，点击开始比赛';
+  } else if (session.gameState === 'FINISHED') {
+    if (stateMachine.getState() !== State.ANIMATING) {
+      stateMachine.to(State.FINISHED);
+    }
+  }
+}
+
+/**
+ * 开启 db.watch 实时监听（主通道）。
+ * 若 watch 底层报错，仅告警，不阻塞；由轮询兜底。
+ */
 function startWatch() {
   if (watchStarted || !session.roomId) return;
   watchStarted = true;
 
   watcher = cloud.watchRoom(
     session.roomId,
-    (room) => {
-      if (room.roundIndex != null) session.roundIndex = room.roundIndex;
-      if (room.roundShooter) session.roundShooter = room.roundShooter;
-      if (room.score) session.score = room.score;
-      if (room.suddenDeath != null) session.suddenDeath = room.suddenDeath;
-      if (room.state) session.gameState = room.state;
-      if (room.winner) session.winner = room.winner;
-
-      const lr = room.lastResult;
-      const settledRound = lr && lr.settledRound;
-      if (settledRound != null && settledRound > session.lastPlayedRound) {
-        const st = stateMachine.getState();
-        // 当前不在动画中才触发（已在动画中的结果由提交响应处理）
-        if (st !== State.ANIMATING && st !== State.NEXT_ROUND) {
-          session.roundSubmitted = false;
-          startAnimation(lr, settledRound);
-        }
-      }
-    },
+    (room) => applyRoomSnapshot(room),
     (err) => {
-      console.error('[bootstrap] watch error', err);
-      // 监听失败不影响主流程，等待用户重新触发提交
+      console.warn('[bootstrap] watch error，轮询兜底接管:', err);
+      startPolling();
     },
   );
+}
+
+/**
+ * 开启房间状态轮询（兜底通道）。
+ * 与 watch 并存，幂等：已有定时器则不重复创建。
+ */
+function startPolling() {
+  if (pollTimer || !session.roomId) return;
+  pollTimer = setInterval(() => {
+    // 已离开 / 已进入对局：轮询不再需要
+    if (session.lobby || !session.roomId || !isRoomWaiting()) {
+      stopPolling();
+      return;
+    }
+    cloud.getRoom(session.roomId).then((resp) => {
+      if (cloud.isSuccess(resp) && resp.data && resp.data.room) {
+        applyRoomSnapshot(resp.data.room);
+      }
+    }).catch((err) => {
+      console.error('[bootstrap] poll getRoom failed', err);
+    });
+  }, POLL_INTERVAL);
+}
+
+/** 停止轮询（幂等） */
+function stopPolling() {
+  if (pollTimer) {
+    clearInterval(pollTimer);
+    pollTimer = null;
+  }
 }
 
 // =====================================================================
