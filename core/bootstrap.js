@@ -52,7 +52,6 @@ const session = {
 };
 
 // ---- 运行期对象 ----
-let ctx = null;
 let watcher = null;         // watchRoom 句柄
 let currentTimeline = null; // 当前动画时间线
 let pose = {};              // tick 输出（ball/keeper/fx/done）
@@ -73,23 +72,16 @@ const uiHandlers = {
 //  一次性初始化
 // =====================================================================
 function init() {
-  // ---- 1. 系统信息 + 画布（物理像素 = 逻辑像素 × dpr）----
-  const sys = wx.getSystemInfoSync() || {};
-  const windowWidth = sys.windowWidth || 375;
-  const windowHeight = sys.windowHeight || 667;
-  const dpr = sys.pixelRatio || 2;
+  // ---- 1. 系统信息 + 缩放（render 内部收敛 wx.getSystemInfoSync，含兜底，绝不在全局作用域触发）----
+  const system = render.initSystem();
+  const { windowWidth, windowHeight, dpr, scaleX, scaleY } = system;
 
   const canvas = wx.createCanvas();
-  canvas.width = windowWidth * dpr;
-  canvas.height = windowHeight * dpr;
-  ctx = canvas.getContext('2d');
+  render.initRender(canvas);
 
-  config.setScreen({ width: windowWidth, height: windowHeight, dpr });
-  render.initRenderer(ctx, { width: canvas.width, height: canvas.height });
-
-  // ---- 2. 手势模块（滑屏 + 点按）----
+  // ---- 2. 手势模块（滑屏 + 点按）：注入 render 计算的缩放，保持坐标映射同源 ----
   if (!inputReady) {
-    input.init();
+    input.init({ windowWidth, windowHeight, dpr, scaleX, scaleY });
     input.setSwipeHandler(onSwipe);
     input.setTapHandler(onTap);
     inputReady = true;
@@ -387,10 +379,18 @@ function startAnimation(result, settledRound) {
 //  点按处理（AABB 命中检测）
 // =====================================================================
 function onTap(p) {
-  // 大厅态：命中「开始比赛」
+  // 大厅态（IDLE）：校验「开始比赛」AABB，未命中时打印排查日志
   if (session.lobby) {
-    if (!session.matching && uiHandlers.onStart && hitTest(p, config.LOBBY.btnStart)) {
-      uiHandlers.onStart();
+    const btn = config.LOBBY.btnStart;
+    if (!session.matching && uiHandlers.onStart) {
+      if (hitTest(p, btn)) {
+        uiHandlers.onStart();
+      } else {
+        console.warn(
+          '[AABB] 未命中「开始比赛」: 点击设计坐标 ' +
+            `x=${p.x}, y=${p.y} | 按钮配置 {x:${btn.x}, y:${btn.y}, w:${btn.w}, h:${btn.h}}`,
+        );
+      }
     }
     return;
   }
@@ -404,11 +404,13 @@ function onTap(p) {
   }
 }
 
-/** AABB 碰撞检测：点是否落在矩形内 */
+/** AABB 碰撞检测：点是否落在矩形内（对非有限坐标做防御，杜绝 NaN 误命中） */
 function hitTest(p, rect) {
-  return (
-    p.x >= rect.x && p.x <= rect.x + rect.w && p.y >= rect.y && p.y <= rect.y + rect.h
-  );
+  if (!p || !rect) return false;
+  const px = Number(p.x);
+  const py = Number(p.y);
+  if (!Number.isFinite(px) || !Number.isFinite(py)) return false;
+  return px >= rect.x && px <= rect.x + rect.w && py >= rect.y && py <= rect.y + rect.h;
 }
 
 // =====================================================================

@@ -3,8 +3,14 @@
  *  Canvas 绘制模块（core/render.js）
  * =====================================================================
  *  基于 750x1334 设计坐标系绘制全部场景元素。
- *  屏幕 dpr 缩放由 bootstrap 设置 canvas.width/height（物理像素），
+ *  屏幕 dpr 缩放由 initSystem()/initRender() 计算，scaleX/scaleY 由此得出，
  *  initRenderer 据此计算 设计空间 → 画布 的缩放，beginFrame 每帧重置变换。
+ *
+ *  时序安全（SOP 2.1）：
+ *    - 本模块全局作用域不调用任何 wx.* API；
+ *    - wx.getSystemInfoSync() 仅在 initSystem() 函数内执行（含 try/catch 兜底），
+ *      由 game.js 在 JSBridge 就绪后按顺序触发，杜绝 scaleX/scaleY=NaN；
+ *    - scaleX/scaleY 通过 getScale() 导出，供 input 等模块做坐标映射。
  *
  *  所有绘制函数均以「设计坐标」为参数，内部负责具体图形。
  * =====================================================================
@@ -23,12 +29,71 @@ const {
   LOBBY,
 } = config;
 
-let ctx = null;   // 2D 上下文
-let scaleX = 1;   // 设计空间 → 画布 横向缩放
-let scaleY = 1;   // 设计空间 → 画布 纵向缩放
+// 兜底屏幕参数（wx.getSystemInfoSync 异常时使用，保证 scaleX/scaleY 永不为 NaN）
+const FALLBACK_W = 375;
+const FALLBACK_H = 667;
+const FALLBACK_DPR = 2;
+
+let ctx = null;        // 2D 上下文
+let scaleX = 1;        // 设计空间 → 画布 横向缩放
+let scaleY = 1;        // 设计空间 → 画布 纵向缩放
+let systemInfo = null; // 系统信息缓存
 
 /**
- * 初始化渲染器。
+ * 初始化系统信息与缩放比例。
+ * 计算物理画布尺寸（逻辑像素 × dpr）与 设计空间 → 画布 的 scaleX/scaleY。
+ * 所有 wx.* 调用均收敛到此函数内（含兜底），可安全在游戏入口后调用。
+ * @returns {{windowWidth:number, windowHeight:number, dpr:number,
+ *            canvasWidth:number, canvasHeight:number, scaleX:number, scaleY:number}}
+ */
+function initSystem() {
+  let sys = null;
+  try {
+    sys = wx.getSystemInfoSync() || {};
+  } catch (err) {
+    console.warn('[render] wx.getSystemInfoSync failed, use fallback 375x667', err);
+    sys = {};
+  }
+
+  const windowWidth = sys.windowWidth || FALLBACK_W;
+  const windowHeight = sys.windowHeight || FALLBACK_H;
+  const dpr = sys.pixelRatio || FALLBACK_DPR;
+  const canvasWidth = Math.round(windowWidth * dpr);
+  const canvasHeight = Math.round(windowHeight * dpr);
+
+  scaleX = canvasWidth / DESIGN_W;
+  scaleY = canvasHeight / DESIGN_H;
+  systemInfo = {
+    windowWidth,
+    windowHeight,
+    dpr,
+    canvasWidth,
+    canvasHeight,
+    scaleX,
+    scaleY,
+  };
+
+  config.setScreen({ width: windowWidth, height: windowHeight, dpr });
+  return systemInfo;
+}
+
+/**
+ * 初始化渲染器（画布版）：设置画布物理尺寸并绑定 2D 上下文。
+ * @param {HTMLCanvasElement} canvas wx.createCanvas() 创建的画布
+ * @returns {CanvasRenderingContext2D|null}
+ */
+function initRender(canvas) {
+  if (!canvas) return null;
+  const system = initSystem();
+  canvas.width = system.canvasWidth;
+  canvas.height = system.canvasHeight;
+  const canvasCtx = canvas.getContext('2d');
+  initRenderer(canvasCtx, { width: canvas.width, height: canvas.height });
+  return canvasCtx;
+}
+
+/**
+ * 初始化渲染器（上下文版，兼容旧调用）。
  * @param {CanvasRenderingContext2D} canvasCtx 由 canvas.getContext('2d') 取得
  * @param {{width:number, height:number}} canvasSize 画布物理像素尺寸
  */
@@ -38,6 +103,16 @@ function initRenderer(canvasCtx, canvasSize) {
     scaleX = canvasSize.width / DESIGN_W;
     scaleY = canvasSize.height / DESIGN_H;
   }
+}
+
+/** 获取当前缩放比例（供 input 等模块做物理坐标 → 设计坐标映射） */
+function getScale() {
+  return { scaleX, scaleY };
+}
+
+/** 获取系统信息缓存（未初始化时自动初始化） */
+function getSystem() {
+  return systemInfo || initSystem();
 }
 
 /** 每帧开头调用：重置变换到设计坐标并清屏 */
@@ -572,7 +647,11 @@ function drawLobby(info) {
 }
 
 module.exports = {
+  initSystem,
+  initRender,
   initRenderer,
+  getScale,
+  getSystem,
   beginFrame,
   drawPitch,
   drawGoal,
