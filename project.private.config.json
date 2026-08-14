@@ -6,5 +6,18 @@
     "urlCheck": true,
     "coverView": true,
     "compileHotReload": true
+  },
+  "condition": {
+    "game": {
+      "list": [
+        {
+          "name": "模拟游客",
+          "pathName": "",
+          "query": "roomId=9b54dbe16a7e7c060047ec2e7e863a87",
+          "scene": 1007,
+          "launchMode": "defalut"
+        }
+      ]
+    }
   }
 }
