@@ -454,11 +454,16 @@ function frame() {
   // ---- 房间等待态（建房/入房成功、开局前）----
   if (isRoomWaiting()) {
     render.drawStatusBar({ roundIndex: '-', hint: session.waitingPrompt || '房间等待中' });
-    render.drawRoomWait({
-      myRole: session.mySide === 'A' ? 'HOST' : 'GUEST',
-      gameState: session.gameState,
-      hint: session.waitingPrompt,
-    });
+    // 防御式调用：即使模块导出/加载存在残留问题，也不让主循环崩溃
+    if (typeof render.drawRoomWait === 'function') {
+      render.drawRoomWait({
+        myRole: session.mySide === 'A' ? 'HOST' : 'GUEST',
+        gameState: session.gameState,
+        hint: session.waitingPrompt,
+      });
+    } else {
+      console.warn('[Defensive] render.drawRoomWait 未定义，已跳过等待态渲染');
+    }
     return;
   }
 

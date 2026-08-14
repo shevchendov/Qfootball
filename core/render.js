@@ -656,6 +656,11 @@ function drawRoomWait(info) {
   const data = info || {};
   const isHost = data.myRole === 'HOST';
   const gameState = data.gameState || 'WAITING';
+  // 防御：配置缺失时使用内置兜底布局，避免此处抛异常连累主循环
+  const roomCfg = ROOM || {};
+  const titleY = roomCfg.titleY != null ? roomCfg.titleY : 700;
+  const hintY = roomCfg.hintY != null ? roomCfg.hintY : 790;
+  const btnStart = roomCfg.btnStart || { x: 225, y: 900, w: 300, h: 100 };
 
   // 标题
   ctx.save();
@@ -664,9 +669,9 @@ function drawRoomWait(info) {
   ctx.textBaseline = 'middle';
   ctx.lineWidth = 8;
   ctx.strokeStyle = 'rgba(0,0,0,0.55)';
-  ctx.strokeText(ROOM.title, DESIGN_W / 2, ROOM.titleY);
+  ctx.strokeText(roomCfg.title || '房间', DESIGN_W / 2, titleY);
   ctx.fillStyle = '#ffd93b';
-  ctx.fillText(ROOM.title, DESIGN_W / 2, ROOM.titleY);
+  ctx.fillText(roomCfg.title || '房间', DESIGN_W / 2, titleY);
   ctx.restore();
 
   // 等待提示（优先级：外部传入 hint > 按状态/角色默认文案）
@@ -684,12 +689,12 @@ function drawRoomWait(info) {
   ctx.textAlign = 'center';
   ctx.textBaseline = 'middle';
   ctx.fillStyle = 'rgba(255,255,255,0.85)';
-  ctx.fillText(hint, DESIGN_W / 2, ROOM.hintY);
+  ctx.fillText(hint, DESIGN_W / 2, hintY);
   ctx.restore();
 
   // 仅房主且好友已就绪（READY）时显示「开始比赛」按钮
   if (isHost && gameState === 'READY') {
-    drawButton(ROOM.btnStart, '开始比赛', '#3a9d4b');
+    drawButton(btnStart, '开始比赛', '#3a9d4b');
   }
 }
 
